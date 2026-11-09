@@ -1100,6 +1100,9 @@ struct SessionWrapper {
     void*              dart_user_data = nullptr;
     std::mutex         cb_mu;
 
+    // announce URLs for magnets that carry no tracker (lt_session_options)
+    std::vector<std::string> fallback_trackers;
+
     // pull queue (for lt_poll_alerts)
     std::mutex              dart_queue_mu;
     std::deque<AlertRecord> dart_queue;
@@ -2037,8 +2040,11 @@ TORRENT_API void lt_set_ssl_cert_path(const char* path) {
 #endif
 }
 
-TORRENT_API lt_session_t lt_create_session(const char* iface, int dl, int ul) {
+TORRENT_API lt_session_t lt_create_session(const lt_session_options* options) {
     try {
+        const lt_session_options none{};
+        const lt_session_options& opts = options ? *options : none;
+        const auto given = [](const char* value) { return value && *value; };
 #ifdef __ANDROID__
         // Fail early with a useful Logcat/lt_last_error message instead of
         // allowing every wss:// tracker to time out ambiguously.
@@ -2057,10 +2063,13 @@ TORRENT_API lt_session_t lt_create_session(const char* iface, int dl, int ul) {
             | lt::alert_category::dht);
 
         sp.set_str(lt::settings_pack::listen_interfaces,
-            (iface && *iface) ? iface : "0.0.0.0:0,[::]:0");
+            given(opts.listen_interfaces) ? opts.listen_interfaces
+                                          : "0.0.0.0:0,[::]:0");
 
-        if (dl > 0) sp.set_int(lt::settings_pack::download_rate_limit, dl);
-        if (ul > 0) sp.set_int(lt::settings_pack::upload_rate_limit,   ul);
+        if (opts.download_rate_limit > 0)
+            sp.set_int(lt::settings_pack::download_rate_limit, opts.download_rate_limit);
+        if (opts.upload_rate_limit > 0)
+            sp.set_int(lt::settings_pack::upload_rate_limit, opts.upload_rate_limit);
 
 #ifdef __ANDROID__
         // Keep TLS verification enabled — the bundled CA file makes wss:// trackers work.
@@ -2074,9 +2083,15 @@ TORRENT_API lt_session_t lt_create_session(const char* iface, int dl, int ul) {
         // empty tier must not block discovery through the remaining tiers.
         // Keep same-tier fallback and each tracker's announce interval intact.
         sp.set_bool(lt::settings_pack::announce_to_all_tiers, true);
-        sp.set_str(lt::settings_pack::user_agent, "Melonbang/1.0");
-        sp.set_str(lt::settings_pack::peer_fingerprint, "-MB1000-");
-        sp.set_str(lt::settings_pack::handshake_client_version, "Melonbang/1.0");
+        // The client identity is the application's; libtorrent's own
+        // defaults apply to whatever it leaves out.
+        if (given(opts.user_agent))
+            sp.set_str(lt::settings_pack::user_agent, opts.user_agent);
+        if (given(opts.peer_fingerprint))
+            sp.set_str(lt::settings_pack::peer_fingerprint, opts.peer_fingerprint);
+        if (given(opts.handshake_client_version))
+            sp.set_str(lt::settings_pack::handshake_client_version,
+                       opts.handshake_client_version);
 
         // Pin the disk I/O backend explicitly instead of trusting the 2.1.x
         // default (pread_disk_io). The pread backend is new in 2.1.0 and has
@@ -2091,6 +2106,11 @@ TORRENT_API lt_session_t lt_create_session(const char* iface, int dl, int ul) {
 #endif
         auto* sw = new SessionWrapper(std::move(params));
         sw->init_default_config();
+        if (given(opts.fallback_trackers)) {
+            std::istringstream lines(opts.fallback_trackers);
+            for (std::string url; std::getline(lines, url);)
+                if (!url.empty()) sw->fallback_trackers.push_back(url);
+        }
         sw->start_alert_thread();
         set_err("");
         return reinterpret_cast<lt_session_t>(sw);
@@ -2187,24 +2207,11 @@ TORRENT_API lt_torrent_id lt_add_magnet(lt_session_t session,
         if (add_flags & 4) atp.flags |= lt::torrent_flags::stop_when_ready;
         atp.flags &= ~lt::torrent_flags::auto_managed;
 
-        // Trackerless magnet (only an info-hash, no &tr=...)? Seed it with a
-        // curated set of public open trackers so peer discovery doesn't have
-        // to wait for DHT bootstrap (which can take 30-60s on a cold start).
-        // These are the same trackers shipped by qBittorrent's default
-        // "automatically add" list and TorrServer.
-        if (atp.trackers.empty()) {
-            static const char* kDefaultTrackers[] = {
-                "udp://tracker.opentrackr.org:1337/announce",
-                "udp://open.demonii.com:1337/announce",
-                "udp://open.stealth.si:80/announce",
-                "udp://tracker.torrent.eu.org:451/announce",
-                "udp://exodus.desync.com:6969/announce",
-                "udp://tracker.openbittorrent.com:6969/announce",
-                "udp://tracker.dler.org:6969/announce",
-                "udp://explodie.org:6969/announce",
-            };
-            for (auto* t : kDefaultTrackers) atp.trackers.emplace_back(t);
-        }
+        // Trackerless magnet (only an info-hash, no &tr=...)? Seed it with
+        // the session's fallback trackers so peer discovery doesn't have to
+        // wait for DHT bootstrap (which can take 30-60s on a cold start).
+        if (atp.trackers.empty())
+            atp.trackers = sw->fallback_trackers;
 
         if (add_flags & 1) {
             atp.storage_mode = lt::storage_mode_sparse;

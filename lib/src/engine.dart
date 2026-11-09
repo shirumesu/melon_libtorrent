@@ -151,13 +151,39 @@ class LibtorrentFlutter implements Finalizable {
   /// Whether the engine has been initialized.
   static bool get isInitialized => _instance != null;
 
+  /// Public trackers added to magnet links that name no tracker, the
+  /// default of [init]'s `fallbackTrackers`.
+  static const List<String> defaultFallbackTrackers = [
+    'udp://tracker.opentrackr.org:1337/announce',
+    'udp://open.demonii.com:1337/announce',
+    'udp://open.stealth.si:80/announce',
+    'udp://tracker.torrent.eu.org:451/announce',
+    'udp://exodus.desync.com:6969/announce',
+    'udp://tracker.openbittorrent.com:6969/announce',
+    'udp://tracker.dler.org:6969/announce',
+    'udp://explodie.org:6969/announce',
+  ];
+
   /// Initialize the libtorrent engine.
   ///
-  /// - [listenInterface] — network interface to listen on (empty = all).
+  /// - [listenInterface] — libtorrent `listen_interfaces` (empty = all
+  ///   interfaces, any port). [configureSession] replaces it.
   /// - [downloadLimit] / [uploadLimit] — speed limits in bytes/sec (0 = unlimited).
   /// - [pollInterval] — how often to poll for torrent/stream status updates.
-  /// - [fetchTrackers] — automatically fetch best public trackers on startup.
+  /// - [fetchTrackers] — fetch a public tracker list on startup and add it
+  ///   to every magnet added afterwards (see [TrackerManager]).
   /// - [defaultSavePath] — where to save torrent data. Defaults to system temp dir.
+  /// - [userAgent] — the client name sent to HTTP trackers and web seeds,
+  ///   for example `MyApp/1.2`. Null keeps libtorrent's
+  ///   `libtorrent/<version>`.
+  /// - [peerFingerprint] — the peer-id prefix announced to other peers, in
+  ///   Azureus style (`-XXvvvv-`, two client letters and four version
+  ///   characters). Null keeps libtorrent's own (`-LT2120-` for 2.1.2).
+  /// - [handshakeClientVersion] — the client name in the extension
+  ///   handshake. Null sends [userAgent].
+  /// - [fallbackTrackers] — trackers added to magnet links that name none,
+  ///   so peers are found before the DHT has bootstrapped. Pass an empty
+  ///   list to rely on the DHT alone.
   static Future<void> init({
     String listenInterface = '',
     int downloadLimit = 0,
@@ -165,6 +191,10 @@ class LibtorrentFlutter implements Finalizable {
     Duration pollInterval = const Duration(milliseconds: 600),
     bool fetchTrackers = true,
     String? defaultSavePath,
+    String? userAgent,
+    String? peerFingerprint,
+    String? handshakeClientVersion,
+    List<String> fallbackTrackers = defaultFallbackTrackers,
   }) async {
     if (_instance != null) return;
     final engine = LibtorrentFlutter._();
@@ -229,13 +259,25 @@ class LibtorrentFlutter implements Finalizable {
       }
     }
 
-    final iface = listenInterface.toNativeUtf8();
+    final strings = <Pointer<Utf8>>[];
+    Pointer<Utf8> native(String? value) {
+      if (value == null || value.isEmpty) return nullptr;
+      final pointer = value.toNativeUtf8();
+      strings.add(pointer);
+      return pointer;
+    }
+
+    final options = calloc<LtSessionOptions>();
     try {
-      final session = engine._b.createSession(
-        iface,
-        downloadLimit,
-        uploadLimit,
-      );
+      options.ref
+        ..listenInterfaces = native(listenInterface)
+        ..downloadRateLimit = downloadLimit
+        ..uploadRateLimit = uploadLimit
+        ..userAgent = native(userAgent)
+        ..peerFingerprint = native(peerFingerprint)
+        ..handshakeClientVersion = native(handshakeClientVersion)
+        ..fallbackTrackers = native(fallbackTrackers.join('\n'));
+      final session = engine._b.createSession(options);
       if (session == nullptr) {
         final err = engine._b.lastError().toDartString();
         throw StateError('Failed to create libtorrent session: $err');
@@ -243,7 +285,8 @@ class LibtorrentFlutter implements Finalizable {
       engine._session = session;
       engine._b.sessionFinalizer.attach(engine, session.cast(), detach: engine);
     } finally {
-      malloc.free(iface);
+      calloc.free(options);
+      strings.forEach(malloc.free);
     }
 
     _instance = engine;

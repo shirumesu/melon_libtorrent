@@ -125,10 +125,22 @@ typedef _SetSslCertPathN = Void Function(Pointer<Utf8>);
 typedef LtSetSslCertPath = void Function(Pointer<Utf8>);
 
 // ─── Session ──────────────────────────────────────────────────────────────────
+final class LtSessionOptions extends Struct {
+  external Pointer<Utf8> listenInterfaces;
+  @Int32()
+  external int downloadRateLimit;
+  @Int32()
+  external int uploadRateLimit;
+  external Pointer<Utf8> userAgent;
+  external Pointer<Utf8> peerFingerprint;
+  external Pointer<Utf8> handshakeClientVersion;
+  external Pointer<Utf8> fallbackTrackers;
+}
+
 typedef _CreateSessionN =
-    Pointer<LtSessionOpaque> Function(Pointer<Utf8>, Int32, Int32);
+    Pointer<LtSessionOpaque> Function(Pointer<LtSessionOptions>);
 typedef LtCreateSession =
-    Pointer<LtSessionOpaque> Function(Pointer<Utf8>, int, int);
+    Pointer<LtSessionOpaque> Function(Pointer<LtSessionOptions>);
 
 typedef _DestroySessionN = Void Function(Pointer<LtSessionOpaque>);
 typedef LtDestroySession = void Function(Pointer<LtSessionOpaque>);

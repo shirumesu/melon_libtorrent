@@ -114,6 +114,23 @@ typedef struct {
     int32_t responsive_mode;         /* 1=enabled (default), 0=disabled */
 } lt_bt_config;
 
+/* Options for lt_create_session. NULL or empty strings select the default
+   noted beside each field. */
+typedef struct {
+    const char* listen_interfaces;        /* default "0.0.0.0:0,[::]:0" */
+    int32_t     download_rate_limit;      /* bytes/s, 0 = unlimited */
+    int32_t     upload_rate_limit;        /* bytes/s, 0 = unlimited */
+    const char* user_agent;               /* HTTP trackers and web seeds;
+                                             default "libtorrent/<version>" */
+    const char* peer_fingerprint;         /* peer-id prefix, e.g. "-LT2120-";
+                                             default libtorrent's */
+    const char* handshake_client_version; /* extension handshake "v"; default
+                                             empty, i.e. the user agent */
+    const char* fallback_trackers;        /* newline-separated announce URLs
+                                             added to magnets that carry no
+                                             tracker; default none */
+} lt_session_options;
+
 typedef void (*lt_alert_callback)(int alert_type, lt_torrent_id id,
                                   const char* message, void* user_data);
 
@@ -126,9 +143,7 @@ TORRENT_API int lt_save_resume(lt_session_t session, lt_torrent_id id, const cha
 /* session */
 /* Android/OpenSSL trust-store setup. Call before lt_create_session(). */
 TORRENT_API void lt_set_ssl_cert_path(const char* path);
-TORRENT_API lt_session_t lt_create_session(const char* listen_interface,
-                                           int download_limit,
-                                           int upload_limit);
+TORRENT_API lt_session_t lt_create_session(const lt_session_options* options);
 TORRENT_API void         lt_destroy_session(lt_session_t session);
 
 /* engine config — port of settings/btsets.go + btserver.go configure() */
