@@ -1,0 +1,23 @@
+name: melon_libtorrent_example
+description: Minimal melon_libtorrent example.
+publish_to: none
+version: 1.0.0
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  melon_libtorrent:
+    path: ..
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
