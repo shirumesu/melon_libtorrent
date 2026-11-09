@@ -120,10 +120,6 @@ typedef LtAlertCallbackDart =
       Pointer<Void> userData,
     );
 
-// ─── SSL cert path (Android WebTorrent) ──────────────────────────────────────
-typedef _SetSslCertPathN = Void Function(Pointer<Utf8>);
-typedef LtSetSslCertPath = void Function(Pointer<Utf8>);
-
 // ─── Session ──────────────────────────────────────────────────────────────────
 final class LtSessionOptions extends Struct {
   external Pointer<Utf8> listenInterfaces;
@@ -368,17 +364,17 @@ String readCharArray(Array<Char> arr, int maxLen) {
 external Pointer<Utf8> _bundledLibraryPath();
 
 DynamicLibrary _openNativeLib() {
-  const libName = 'melon_libtorrent';
   if (Platform.isWindows) {
-    return DynamicLibrary.open('$libName.dll');
-  } else if (Platform.isAndroid) {
-    return DynamicLibrary.open('lib$libName.so');
+    // Bundled next to the executable by the Windows plugin (windows/).
+    return DynamicLibrary.open('melon_libtorrent.dll');
   } else if (Platform.isMacOS || Platform.isLinux) {
+    // A native code asset of the build hook (hook/build.dart).
     return DynamicLibrary.open(_bundledLibraryPath().toDartString());
-  } else if (Platform.isIOS) {
-    return DynamicLibrary.process();
   }
-  throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
+  throw UnsupportedError(
+    'melon_libtorrent supports macOS, Windows and Linux, '
+    'not ${Platform.operatingSystem}',
+  );
 }
 
 // ─── Binding loader ─────────────────────────────────────────────────────────
@@ -422,7 +418,6 @@ class TorrentBridgeBindings {
   late final LtGetActiveStreams getActiveStreams;
   late final LtLastError lastError;
   late final LtVersion version;
-  late final LtSetSslCertPath setSslCertPath;
 
   TorrentBridgeBindings(this._lib) {
     createSession = _lib
@@ -525,9 +520,6 @@ class TorrentBridgeBindings {
     version = _lib
         .lookup<NativeFunction<_VersionN>>('lt_version')
         .asFunction<LtVersion>();
-    setSslCertPath = _lib
-        .lookup<NativeFunction<_SetSslCertPathN>>('lt_set_ssl_cert_path')
-        .asFunction<LtSetSslCertPath>();
   }
 
   factory TorrentBridgeBindings.open() =>

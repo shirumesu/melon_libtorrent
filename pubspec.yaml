@@ -31,8 +31,6 @@ flutter:
     platforms:
       windows:
         ffiPlugin: true
-  assets:
-    - assets/cacert.pem
   licenses:
     - licenses/boost.txt
     - licenses/libtorrent.txt

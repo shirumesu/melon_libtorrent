@@ -3,13 +3,11 @@
 // status polling, and a built-in HTTP streaming server.
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:math';
 
 import 'package:ffi/ffi.dart';
-import 'package:flutter/services.dart' show rootBundle;
 
 import 'ffi_bindings.dart';
 import 'models.dart';
@@ -220,58 +218,6 @@ class LibtorrentFlutter implements Finalizable {
 
     final lib = TorrentBridgeBindings.open();
     engine._b = lib;
-
-    if (Platform.isAndroid) {
-      try {
-        // Android does not expose its platform trust store in a form that the
-        // statically linked OpenSSL build can reliably consume. Ship a PEM CA
-        // bundle with the plugin, copy it to an ordinary app-readable file,
-        // and set SSL_CERT_FILE before the native libtorrent session starts.
-        final certDir = Directory(
-          '${Directory.systemTemp.path}/melon_libtorrent',
-        );
-        await certDir.create(recursive: true);
-
-        final certFile = File('${certDir.path}/cacert.pem');
-        final byteData = await rootBundle.load(
-          'packages/melon_libtorrent/assets/cacert.pem',
-        );
-        final certBytes = byteData.buffer.asUint8List(
-          byteData.offsetInBytes,
-          byteData.lengthInBytes,
-        );
-
-        // A normal Mozilla CA bundle is well over 100 KB.
-        final certText = ascii.decode(certBytes, allowInvalid: true);
-        if (certBytes.length < 100 * 1024 ||
-            !certText.contains('-----BEGIN CERTIFICATE-----')) {
-          throw const FormatException(
-            'Bundled cacert.pem is invalid or too small',
-          );
-        }
-
-        // Write atomically so a killed process cannot leave a partial bundle.
-        final pendingFile = File('${certFile.path}.pending');
-        await pendingFile.writeAsBytes(certBytes, flush: true);
-        if (await certFile.exists()) {
-          await certFile.delete();
-        }
-        await pendingFile.rename(certFile.path);
-
-        final certPathPtr = certFile.path.toNativeUtf8();
-        try {
-          engine._b.setSslCertPath(certPathPtr);
-        } finally {
-          malloc.free(certPathPtr);
-        }
-      } catch (e) {
-        throw StateError(
-          'melon_libtorrent: failed to prepare Android CA bundle: $e\n'
-          'Make sure assets/cacert.pem is present in the package. '
-          'Download it from https://curl.se/ca/cacert.pem',
-        );
-      }
-    }
 
     final strings = <Pointer<Utf8>>[];
     Pointer<Utf8> native(String? value) {

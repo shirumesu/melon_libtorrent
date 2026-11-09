@@ -1,6 +1,6 @@
-// torrent_bridge.cpp — libtorrent 2.0 streaming engine
+// torrent_bridge.cpp — libtorrent 2.1 streaming engine
 // TorrServer-grade streaming: function-by-function C++ port of TorrServer's Go code
-// Cross-platform: Windows, Linux, macOS, Android, iOS
+// Desktop: Windows, Linux, macOS
 //
 // Go source mapping:
 //   torrstor/ranges.go   → PieceRange, in_ranges(), merge_ranges()
@@ -21,13 +21,6 @@
 
 #include "torrent_bridge.h"
 
-#ifdef __ANDROID__
-#include <android/log.h>
-#include <cstdlib>
-#include <sys/stat.h>
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-#endif
 
 #include <libtorrent/load_torrent.hpp>
 #include <libtorrent/write_resume_data.hpp>
@@ -49,7 +42,6 @@
 #include <libtorrent/file_storage.hpp>
 #include <libtorrent/download_priority.hpp>
 #include <libtorrent/mmap_disk_io.hpp>
-#include <libtorrent/posix_disk_io.hpp>
 
 // ── cross-platform sockets ──────────────────────────────────────────────────────
 #ifdef _WIN32
@@ -134,51 +126,6 @@ static FILE* tb_log_file() {
 static thread_local std::string g_last_error;
 static void set_err(const std::string& s) { g_last_error = s; }
 
-#ifdef __ANDROID__
-static std::string android_openssl_error() {
-    unsigned long code = ERR_get_error();
-    if (code == 0) return "unknown OpenSSL error";
-    char buf[256] = {0};
-    ERR_error_string_n(code, buf, sizeof(buf));
-    return std::string(buf);
-}
-
-static void validate_android_ca_bundle() {
-    const char* path = std::getenv("SSL_CERT_FILE");
-    if (!path || !*path) {
-        throw std::runtime_error(
-            "SSL_CERT_FILE was not set before creating the libtorrent session");
-    }
-
-    struct stat st {};
-    if (stat(path, &st) != 0 || st.st_size < 100 * 1024) {
-        throw std::runtime_error(
-            std::string("Android CA bundle is missing or too small: ") + path);
-    }
-
-    ERR_clear_error();
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) {
-        throw std::runtime_error(
-            std::string("SSL_CTX_new failed: ") + android_openssl_error());
-    }
-
-    const int loaded = SSL_CTX_load_verify_locations(ctx, path, nullptr);
-    SSL_CTX_free(ctx);
-    if (loaded != 1) {
-        throw std::runtime_error(
-            std::string("OpenSSL could not load Android CA bundle '") + path
-            + "': " + android_openssl_error());
-    }
-
-    __android_log_print(
-        ANDROID_LOG_INFO,
-        "libtorrent_native",
-        "Validated OpenSSL CA bundle: %s (%lld bytes)",
-        path,
-        static_cast<long long>(st.st_size));
-}
-#endif
 
 // ── file extension checks ───────────────────────────────────────────────────────
 static bool is_streamable(const std::string& name) {
@@ -2043,32 +1990,11 @@ static void preload_stream(StreamEngine* s, int64_t preload_bytes) {
 
 extern "C" {
 
-TORRENT_API void lt_set_ssl_cert_path(const char* path) {
-#ifdef __ANDROID__
-    if (path && *path) {
-        setenv("SSL_CERT_FILE", path, 1);
-        unsetenv("SSL_CERT_DIR");
-        __android_log_print(
-            ANDROID_LOG_INFO,
-            "libtorrent_native",
-            "SSL_CERT_FILE set to %s",
-            path);
-    }
-#else
-    (void)path;
-#endif
-}
-
 TORRENT_API lt_session_t lt_create_session(const lt_session_options* options) {
     try {
         const lt_session_options none{};
         const lt_session_options& opts = options ? *options : none;
         const auto given = [](const char* value) { return value && *value; };
-#ifdef __ANDROID__
-        // Fail early with a useful Logcat/lt_last_error message instead of
-        // allowing every wss:// tracker to time out ambiguously.
-        validate_android_ca_bundle();
-#endif
         lt::settings_pack sp;
 
         // alert categories
@@ -2090,10 +2016,6 @@ TORRENT_API lt_session_t lt_create_session(const lt_session_options* options) {
         if (opts.upload_rate_limit > 0)
             sp.set_int(lt::settings_pack::upload_rate_limit, opts.upload_rate_limit);
 
-#ifdef __ANDROID__
-        // Keep TLS verification enabled — the bundled CA file makes wss:// trackers work.
-        sp.set_bool(lt::settings_pack::validate_https_trackers, true);
-#endif
 
         // Use libtorrent's tested desktop defaults for transport, disk and
         // piece picking. Application queue policy is applied per torrent.
@@ -2113,16 +2035,11 @@ TORRENT_API lt_session_t lt_create_session(const lt_session_options* options) {
                        opts.handshake_client_version);
 
         // Pin the disk I/O backend explicitly instead of trusting the 2.1.x
-        // default (pread_disk_io). The pread backend is new in 2.1.0 and has
-        // been observed to produce corrupt read-back on Android filesystems.
-        // Use posix on Android (most reliable per LibreTorrent findings),
-        // mmap on desktop (the proven 2.0.x default).
+        // default (pread_disk_io): the pread backend is new in 2.1.0 and has
+        // been observed to produce corrupt read-back on some filesystems;
+        // mmap is the proven 2.0.x default.
         lt::session_params params(std::move(sp));
-#ifdef __ANDROID__
-        params.disk_io_constructor = lt::posix_disk_io_constructor;
-#else
         params.disk_io_constructor = lt::mmap_disk_io_constructor;
-#endif
         auto* sw = new SessionWrapper(std::move(params));
         sw->init_default_config();
         if (given(opts.fallback_trackers)) {
@@ -2461,9 +2378,6 @@ TORRENT_API int lt_get_files(lt_session_t session, lt_torrent_id id,
     try {
         auto ti = it->second.torrent_file();
         if (!ti) {
-#ifdef __ANDROID__
-            __android_log_print(ANDROID_LOG_ERROR, "melon_libtorrent", "lt_get_files: ti is null");
-#endif
             return 0;
         }
         const lt::file_storage& fs = ti->layout();
@@ -2484,19 +2398,10 @@ TORRENT_API int lt_get_files(lt_session_t session, lt_torrent_id id,
             out[n].name[sizeof(out[n].name) - 1] = 0;
             out[n].path[sizeof(out[n].path) - 1] = 0;
         }
-#ifdef __ANDROID__
-        __android_log_print(ANDROID_LOG_INFO, "melon_libtorrent", "lt_get_files: successfully processed %d files", n);
-#endif
         return n;
     } catch ([[maybe_unused]] const std::exception& e) {
-#ifdef __ANDROID__
-        __android_log_print(ANDROID_LOG_ERROR, "melon_libtorrent", "lt_get_files exception: %s", e.what());
-#endif
         return 0;
     } catch (...) {
-#ifdef __ANDROID__
-        __android_log_print(ANDROID_LOG_ERROR, "melon_libtorrent", "lt_get_files unknown exception");
-#endif
         return 0;
     }
 }
