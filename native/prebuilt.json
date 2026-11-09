@@ -1,12 +1,12 @@
 {
-  "version": "0.1.0",
-  "release": "https://github.com/shirumesu/melon_libtorrent/releases/download/v0.1.0",
+  "version": "0.1.1",
+  "release": "https://github.com/shirumesu/melon_libtorrent/releases/download/v0.1.1",
   "sources": "037b5380a2a151bcfc77248b24a5ba96f01b6a75730fefbd2bf5c5a5968d8570",
   "macosDeploymentTarget": "10.15",
   "files": {
-    "libmelon_libtorrent-linux-x64.so": "d24a8dc1310423c06d20fda367bf627535a6df838d27f946ac536009e9729856",
-    "libmelon_libtorrent-macos-arm64.dylib": "79b10c4166cdcddfad5c3b6aa71298e10f68b3312f73fdf71cee18762feec14b",
-    "libmelon_libtorrent-macos-x64.dylib": "0688a3a183919f2de8eebabcefb261c68bde6bbac987cf5c8c85bc3deee2deba",
-    "melon_libtorrent-windows-x64.dll": "c1d0b139bd2e479155acb3088addd715931f8c3ec72b6fd35f1b9189d0455d55"
+    "libmelon_libtorrent-linux-x64.so": "22a5940c561507e6bd377989f50e454c0acde044de0864d3c1981d95b37132d6",
+    "libmelon_libtorrent-macos-arm64.dylib": "8d5e4265228984c537ea6b91894f66771b75571d0d303d839f5c7ba80e1073bb",
+    "libmelon_libtorrent-macos-x64.dylib": "f1c36a39c2243d7d77ab0384708c32e54059270290ca8d31108226847ac326be",
+    "melon_libtorrent-windows-x64.dll": "aec6f2d8b6d404760c0c541d204a44aa916ad0ff9c8da8e4a18fabcc8376d461"
   }
 }
