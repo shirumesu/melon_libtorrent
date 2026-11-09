@@ -184,13 +184,13 @@ class LibtorrentFlutter implements Finalizable {
         // bundle with the plugin, copy it to an ordinary app-readable file,
         // and set SSL_CERT_FILE before the native libtorrent session starts.
         final certDir = Directory(
-          '${Directory.systemTemp.path}/libtorrent_flutter',
+          '${Directory.systemTemp.path}/melon_libtorrent',
         );
         await certDir.create(recursive: true);
 
         final certFile = File('${certDir.path}/cacert.pem');
         final byteData = await rootBundle.load(
-          'packages/libtorrent_flutter/assets/cacert.pem',
+          'packages/melon_libtorrent/assets/cacert.pem',
         );
         final certBytes = byteData.buffer.asUint8List(
           byteData.offsetInBytes,
@@ -222,7 +222,7 @@ class LibtorrentFlutter implements Finalizable {
         }
       } catch (e) {
         throw StateError(
-          'libtorrent_flutter: failed to prepare Android CA bundle: $e\n'
+          'melon_libtorrent: failed to prepare Android CA bundle: $e\n'
           'Make sure assets/cacert.pem is present in the package. '
           'Download it from https://curl.se/ca/cacert.pem',
         );

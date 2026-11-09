@@ -332,7 +332,7 @@ String readCharArray(Array<Char> arr, int maxLen) {
 external Pointer<Utf8> _bundledLibraryPath();
 
 DynamicLibrary _openNativeLib() {
-  const libName = 'libtorrent_flutter';
+  const libName = 'melon_libtorrent';
   if (Platform.isWindows) {
     return DynamicLibrary.open('$libName.dll');
   } else if (Platform.isAndroid) {

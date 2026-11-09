@@ -1,4 +1,4 @@
-// Models for libtorrent_flutter
+// Models for melon_libtorrent
 
 /// Torrent download state.
 enum TorrentState {

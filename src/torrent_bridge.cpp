@@ -2436,7 +2436,7 @@ TORRENT_API int lt_get_files(lt_session_t session, lt_torrent_id id,
         auto ti = it->second.torrent_file();
         if (!ti) {
 #ifdef __ANDROID__
-            __android_log_print(ANDROID_LOG_ERROR, "libtorrent_flutter", "lt_get_files: ti is null");
+            __android_log_print(ANDROID_LOG_ERROR, "melon_libtorrent", "lt_get_files: ti is null");
 #endif
             return 0;
         }
@@ -2459,17 +2459,17 @@ TORRENT_API int lt_get_files(lt_session_t session, lt_torrent_id id,
             out[n].path[sizeof(out[n].path) - 1] = 0;
         }
 #ifdef __ANDROID__
-        __android_log_print(ANDROID_LOG_INFO, "libtorrent_flutter", "lt_get_files: successfully processed %d files", n);
+        __android_log_print(ANDROID_LOG_INFO, "melon_libtorrent", "lt_get_files: successfully processed %d files", n);
 #endif
         return n;
     } catch ([[maybe_unused]] const std::exception& e) {
 #ifdef __ANDROID__
-        __android_log_print(ANDROID_LOG_ERROR, "libtorrent_flutter", "lt_get_files exception: %s", e.what());
+        __android_log_print(ANDROID_LOG_ERROR, "melon_libtorrent", "lt_get_files exception: %s", e.what());
 #endif
         return 0;
     } catch (...) {
 #ifdef __ANDROID__
-        __android_log_print(ANDROID_LOG_ERROR, "libtorrent_flutter", "lt_get_files unknown exception");
+        __android_log_print(ANDROID_LOG_ERROR, "melon_libtorrent", "lt_get_files unknown exception");
 #endif
         return 0;
     }

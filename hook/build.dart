@@ -22,7 +22,7 @@ void main(List<String> args) async {
       macOS ? 'macos-$architecture-$deploymentTarget/' : 'linux-$architecture/',
     );
     final library = nativeDirectory.resolve(
-      macOS ? 'liblibtorrent_flutter.dylib' : 'liblibtorrent_flutter.so',
+      macOS ? 'libmelon_libtorrent.dylib' : 'libmelon_libtorrent.so',
     );
     final script = macOS ? 'native/build-macos.sh' : 'native/build-linux.sh';
     final process = await Process.start('/bin/bash', [
@@ -40,7 +40,7 @@ void main(List<String> args) async {
     }
     output.assets.code.add(
       CodeAsset(
-        package: 'libtorrent_flutter',
+        package: 'melon_libtorrent',
         name: 'src/ffi_bindings.dart',
         linkMode: DynamicLoadingBundled(),
         file: library,

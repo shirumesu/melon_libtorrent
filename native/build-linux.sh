@@ -67,4 +67,4 @@ cmake -S "$source_dir" -B "$cache_dir/bridge" -G Ninja \
   -DOPENSSL_ROOT_DIR="$openssl_install" \
   -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$output_dir"
 cmake --build "$cache_dir/bridge" --parallel "$(nproc)"
-strip --strip-unneeded "$output_dir/liblibtorrent_flutter.so"
+strip --strip-unneeded "$output_dir/libmelon_libtorrent.so"
