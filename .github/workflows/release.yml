@@ -35,7 +35,7 @@ jobs:
         run: brew install ninja boost
       - name: Build
         run: |
-          native/build-macos.sh "$RUNNER_TEMP/out" ${{ matrix.arch }} "$MACOS_DEPLOYMENT_TARGET"
+          bash native/build-macos.sh "$RUNNER_TEMP/out" ${{ matrix.arch }} "$MACOS_DEPLOYMENT_TARGET"
           mkdir dist
           cp "$RUNNER_TEMP/out/libmelon_libtorrent.dylib" "dist/${{ matrix.asset }}"
           lipo -info "dist/${{ matrix.asset }}"
@@ -55,7 +55,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       - name: Build
         run: |
-          native/build-linux.sh "$RUNNER_TEMP/out" x86_64
+          bash native/build-linux.sh "$RUNNER_TEMP/out" x86_64
           mkdir dist
           cp "$RUNNER_TEMP/out/libmelon_libtorrent.so" dist/libmelon_libtorrent-linux-x64.so
       - uses: actions/upload-artifact@v4
