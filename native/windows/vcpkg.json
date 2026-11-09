@@ -1,0 +1,7 @@
+{
+  "name": "melon-libtorrent-release",
+  "version-string": "0.1.0",
+  "dependencies": [
+    { "name": "libtorrent", "default-features": false, "features": ["deprfun"] }
+  ]
+}

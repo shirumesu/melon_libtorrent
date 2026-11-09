@@ -1,0 +1,138 @@
+name: Release
+
+# A version tag (v0.1.0) builds the bridge library for every desktop target
+# and publishes a GitHub Release with the binaries, SHA256SUMS and
+# prebuilt.json. Copy that prebuilt.json to native/prebuilt.json and commit
+# it before `dart pub publish`, so the published package pins those
+# binaries; see "Releasing" in README.md. A manual run builds without
+# releasing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Oldest macOS Flutter supports; the hook uses the prebuilt for any
+  # app deployment target at or above it.
+  MACOS_DEPLOYMENT_TARGET: '10.15'
+
+jobs:
+  macos:
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            asset: libmelon_libtorrent-macos-arm64.dylib
+          - arch: x86_64
+            asset: libmelon_libtorrent-macos-x64.dylib
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build tools
+        run: brew install ninja boost
+      - name: Build
+        run: |
+          native/build-macos.sh "$RUNNER_TEMP/out" ${{ matrix.arch }} "$MACOS_DEPLOYMENT_TARGET"
+          mkdir dist
+          cp "$RUNNER_TEMP/out/libmelon_libtorrent.dylib" "dist/${{ matrix.asset }}"
+          lipo -info "dist/${{ matrix.asset }}"
+          otool -l "dist/${{ matrix.asset }}" | grep -A4 LC_BUILD_VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  linux:
+    # The oldest supported runner, so the binary runs on glibc 2.35 and newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build
+        run: |
+          native/build-linux.sh "$RUNNER_TEMP/out" x86_64
+          mkdir dist
+          cp "$RUNNER_TEMP/out/libmelon_libtorrent.so" dist/libmelon_libtorrent-linux-x64.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmelon_libtorrent-linux-x64.so
+          path: dist/libmelon_libtorrent-linux-x64.so
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S native/windows -B build -A x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item build/plugin/Release/melon_libtorrent.dll dist/melon_libtorrent-windows-x64.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: melon_libtorrent-windows-x64.dll
+          path: dist/melon_libtorrent-windows-x64.dll
+          if-no-files-found: error
+
+  release:
+    needs: [macos, linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check the tag against pubspec.yaml
+        run: |
+          version=$(sed -n 's/^version: *//p' pubspec.yaml)
+          test "v$version" = "$GITHUB_REF_NAME" || {
+            echo "Tag $GITHUB_REF_NAME does not match pubspec version $version" >&2
+            exit 1
+          }
+      - name: Checksums and prebuilt.json
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          # The fingerprint the build hook and the Windows plugin compute;
+          # same files, same order (hook/build.dart prebuiltSources).
+          sources=$(cat src/torrent_bridge.h src/torrent_bridge.cpp native/native_library_path.c \
+            | tr -d '\r' | sha256sum | cut -d' ' -f1)
+          cd dist
+          sha256sum -- * > ../SHA256SUMS
+          cd ..
+          python3 - "$version" "$sources" <<'PY'
+          import json, sys
+          version, sources = sys.argv[1:]
+          files = {}
+          for line in open('SHA256SUMS'):
+              digest, name = line.split()
+              files[name.lstrip('*')] = digest
+          json.dump({
+              'version': version,
+              'release': f'https://github.com/${{ github.repository }}/releases/download/v{version}',
+              'sources': sources,
+              'macosDeploymentTarget': '${{ env.MACOS_DEPLOYMENT_TARGET }}',
+              'files': dict(sorted(files.items())),
+          }, open('prebuilt.json', 'w'), indent=2)
+          open('prebuilt.json', 'a').write('\n')
+          PY
+          cat SHA256SUMS prebuilt.json
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* SHA256SUMS prebuilt.json \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Prebuilt bridge libraries for melon_libtorrent ${GITHUB_REF_NAME#v}. Verify with SHA256SUMS; the package's build hook and Windows plugin verify them against native/prebuilt.json."

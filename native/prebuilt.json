@@ -1,0 +1,7 @@
+{
+  "version": "0.1.0",
+  "release": "https://github.com/shirumesu/melon_libtorrent/releases/download/v0.1.0",
+  "sources": null,
+  "macosDeploymentTarget": "10.15",
+  "files": {}
+}
