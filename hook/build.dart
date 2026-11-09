@@ -126,10 +126,20 @@ Future<File?> _prebuilt(
     if (deployment < AppleVersion(major, minor: minor)) return null;
   }
 
+  // Saved under the source build's file name: Flutter names the bundled
+  // framework after it and merges architectures by it.
   final directory = Directory.fromUri(
-    input.outputDirectoryShared.resolve('prebuilt-${pins['version']}/'),
+    input.outputDirectoryShared.resolve(
+      'prebuilt-${pins['version']}/${name.substring(0, name.lastIndexOf('.'))}/',
+    ),
   );
-  final file = File.fromUri(directory.uri.resolve(name));
+  final file = File.fromUri(
+    directory.uri.resolve(
+      name.endsWith('.dylib')
+          ? 'libmelon_libtorrent.dylib'
+          : 'libmelon_libtorrent.so',
+    ),
+  );
   if (file.existsSync() && await _sha256(file) == expected) return file;
 
   final url = Uri.parse('${pins['release']}/$name');
