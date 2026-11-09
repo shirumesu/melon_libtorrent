@@ -131,6 +131,22 @@ typedef struct {
                                              tracker; default none */
 } lt_session_options;
 
+/* Playback window of an HTTP stream (lt_start_stream). Zero fields take
+   the default noted beside them. Pieces ahead of the reader form a sliding
+   window; the first critical_bytes of it are top priority with deadlines,
+   the rest rank just below. Reads in the file's tail (container indexes)
+   are probes and do not move the window. */
+typedef struct {
+    int64_t window_bytes;         /* default 24 MiB */
+    int32_t min_window_pieces;    /* default 2 */
+    int32_t max_window_pieces;    /* default 48 */
+    int64_t critical_bytes;       /* default 8 MiB, at least one piece */
+    int32_t tail_probe_ppm;       /* tail size, parts per million of the
+                                     file; default 20000 (2%) */
+    int64_t tail_probe_min_bytes; /* default 4 MiB */
+    int64_t tail_probe_max_bytes; /* default 32 MiB */
+} lt_stream_config;
+
 typedef void (*lt_alert_callback)(int alert_type, lt_torrent_id id,
                                   const char* message, void* user_data);
 
@@ -195,7 +211,8 @@ TORRENT_API void lt_set_file_priorities(lt_session_t session, lt_torrent_id id,
 TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
                                          lt_torrent_id torrent_id,
                                          int file_index,
-                                         int64_t max_cache_bytes);
+                                         int64_t max_cache_bytes,
+                                         const lt_stream_config* config);
 TORRENT_API void         lt_stop_stream(lt_session_t session, lt_stream_id id);
 TORRENT_API int          lt_get_stream_status(lt_session_t session,
                                               lt_stream_id id,

@@ -127,6 +127,11 @@ class LibtorrentFlutter implements Finalizable {
   late final Pointer<LtSessionOpaque> _session;
   late final String _defaultSavePath;
 
+  /// Playback window used by [startStream] when it is given none; set by
+  /// [init] and changeable at any time. Running streams keep the
+  /// configuration they started with.
+  StreamingConfig streamingConfig = const StreamingConfig();
+
   // Torrent status
   final _torrentsCtrl = StreamController<Map<int, TorrentInfo>>.broadcast();
   final Map<int, TorrentInfo> _torrents = {};
@@ -184,6 +189,8 @@ class LibtorrentFlutter implements Finalizable {
   /// - [fallbackTrackers] — trackers added to magnet links that name none,
   ///   so peers are found before the DHT has bootstrapped. Pass an empty
   ///   list to rely on the DHT alone.
+  /// - [streaming] — the playback window of streams started without their
+  ///   own configuration; see [streamingConfig].
   static Future<void> init({
     String listenInterface = '',
     int downloadLimit = 0,
@@ -195,6 +202,7 @@ class LibtorrentFlutter implements Finalizable {
     String? peerFingerprint,
     String? handshakeClientVersion,
     List<String> fallbackTrackers = defaultFallbackTrackers,
+    StreamingConfig streaming = const StreamingConfig(),
   }) async {
     if (_instance != null) return;
     final engine = LibtorrentFlutter._();
@@ -290,6 +298,7 @@ class LibtorrentFlutter implements Finalizable {
     }
 
     _instance = engine;
+    engine.streamingConfig = streaming;
     engine._defaultSavePath = defaultSavePath ?? Directory.systemTemp.path;
     engine._startPolling(pollInterval);
   }
@@ -463,17 +472,35 @@ class LibtorrentFlutter implements Finalizable {
   /// Returns [StreamInfo] with an HTTP URL that can be passed to any video player.
   /// [fileIndex] = -1 auto-selects the largest streamable file.
   /// [maxCacheBytes] controls how much RAM the piece cache uses (0 = default ~128MB).
+  /// [streaming] overrides [streamingConfig] for this stream.
   StreamInfo startStream(
     int torrentId, {
     int fileIndex = -1,
     int maxCacheBytes = 0,
+    StreamingConfig? streaming,
   }) {
-    final streamId = _b.startStream(
-      _session,
-      torrentId,
-      fileIndex,
-      maxCacheBytes,
-    );
+    final window = streaming ?? streamingConfig;
+    final config = calloc<LtStreamConfig>();
+    final int streamId;
+    try {
+      config.ref
+        ..windowBytes = window.windowBytes
+        ..minWindowPieces = window.minWindowPieces
+        ..maxWindowPieces = window.maxWindowPieces
+        ..criticalBytes = window.criticalBytes
+        ..tailProbePpm = (window.tailProbeFraction * 1000000).round()
+        ..tailProbeMinBytes = window.tailProbeMinBytes
+        ..tailProbeMaxBytes = window.tailProbeMaxBytes;
+      streamId = _b.startStream(
+        _session,
+        torrentId,
+        fileIndex,
+        maxCacheBytes,
+        config,
+      );
+    } finally {
+      calloc.free(config);
+    }
     if (streamId < 0) {
       throw Exception('startStream failed: ${_b.lastError().toDartString()}');
     }

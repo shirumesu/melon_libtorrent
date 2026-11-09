@@ -885,13 +885,15 @@ struct StreamEngine {
 
     // Pieces ahead of the read head carry deadlines, so the swarm keeps the
     // playback window full instead of starting a piece when the reader
-    // blocks on it. Only the first CRITICAL_BYTES are top priority: a piece
-    // completes only when all of it has arrived, and the swarm spreads its
-    // requests over every top-priority piece, so with large pieces (16 MB in
-    // season batches) a wider top window finishes all of them at once, long
-    // after the one under the reader could have.
-    static constexpr int64_t WINDOW_BYTES = 24 * 1024 * 1024;
-    static constexpr int64_t CRITICAL_BYTES = 8 * 1024 * 1024;
+    // blocks on it (upstream set deadlines only then, so the swarm idled at
+    // every window boundary). Only the first critical_bytes (8 MiB by
+    // default) are top priority: a piece completes only when all of it has
+    // arrived, and the swarm spreads its requests over every top-priority
+    // piece, so with large pieces (16 MB in season batches) a wider top
+    // window finishes all of them at once, long after the one under the
+    // reader could have. Measured on a 16 MiB-piece episode: 96 s to the
+    // first frame with an 8-piece top window, 51 s with this split.
+    // Sizes come from lt_stream_config; see apply_config.
     int window_pieces = 8;
     int critical_pieces = 1;
     int window_head = -1;
@@ -957,10 +959,32 @@ struct StreamEngine {
     // The region is a few MB rather than a count of pieces: ten 16 MB pieces
     // are most of an episode, and a resume read there was taken for a probe,
     // so the window stayed on the header and the resume point never came.
+    int64_t tail_probe_bytes = 4 << 20;
     bool is_tail_probe(int64_t off) const {
-        const int64_t tail = std::clamp(
-            file_size / 50, (int64_t)4 << 20, (int64_t)32 << 20);
-        return off > file_size - tail;
+        return off > file_size - tail_probe_bytes;
+    }
+
+    // Derives the window and tail sizes from [config] (zero fields take the
+    // defaults) once piece_length and file_size are known.
+    void apply_config(const lt_stream_config* config) {
+        const lt_stream_config none{};
+        const lt_stream_config& c = config ? *config : none;
+        const auto pick = [](int64_t value, int64_t fallback) {
+            return value > 0 ? value : fallback;
+        };
+        const int64_t window_bytes = pick(c.window_bytes, 24 << 20);
+        const int64_t critical_bytes = pick(c.critical_bytes, 8 << 20);
+        const int min_pieces = (int)pick(c.min_window_pieces, 2);
+        const int max_pieces = std::max(min_pieces, (int)pick(c.max_window_pieces, 48));
+        window_pieces = (int)std::clamp(
+            window_bytes / piece_length, (int64_t)min_pieces, (int64_t)max_pieces);
+        critical_pieces = (int)std::clamp(
+            critical_bytes / piece_length, (int64_t)1, (int64_t)window_pieces);
+
+        const int64_t ppm = std::min<int64_t>(pick(c.tail_probe_ppm, 20000), 1000000);
+        const int64_t tail_min = pick(c.tail_probe_min_bytes, (int64_t)4 << 20);
+        const int64_t tail_max = std::max(tail_min, pick(c.tail_probe_max_bytes, (int64_t)32 << 20));
+        tail_probe_bytes = std::clamp(file_size * ppm / 1000000, tail_min, tail_max);
     }
 
     int byte_to_piece(int64_t off) const {
@@ -2508,7 +2532,8 @@ TORRENT_API void lt_set_file_priorities(lt_session_t session, lt_torrent_id id,
 TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
                                          lt_torrent_id torrent_id,
                                          int file_index,
-                                         int64_t max_cache_bytes) {
+                                         int64_t max_cache_bytes,
+                                         const lt_stream_config* config) {
     if (!session) { set_err("null session"); return -1; }
     auto* sw = to_sw(session);
 
@@ -2558,11 +2583,7 @@ TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
                      (int)((s->file_offset + s->file_size - 1) / s->piece_length));
     s->total_pieces = s->end_piece - s->start_piece + 1;
 
-    s->window_pieces = std::clamp(
-        (int)(StreamEngine::WINDOW_BYTES / s->piece_length), 2, 48);
-    s->critical_pieces = std::clamp(
-        (int)(StreamEngine::CRITICAL_BYTES / s->piece_length), 1,
-        s->window_pieces);
+    s->apply_config(config);
 
     // Media bitrate guessed from file size, for buffer_seconds only.
     {

@@ -233,9 +233,33 @@ typedef LtSetFilePriorities =
     void Function(Pointer<LtSessionOpaque>, int, Pointer<Int32>, int);
 
 // ─── Stream management ──────────────────────────────────────────────────────
+final class LtStreamConfig extends Struct {
+  @Int64()
+  external int windowBytes;
+  @Int32()
+  external int minWindowPieces;
+  @Int32()
+  external int maxWindowPieces;
+  @Int64()
+  external int criticalBytes;
+  @Int32()
+  external int tailProbePpm;
+  @Int64()
+  external int tailProbeMinBytes;
+  @Int64()
+  external int tailProbeMaxBytes;
+}
+
 typedef _StartStreamN =
-    Int64 Function(Pointer<LtSessionOpaque>, Int64, Int32, Int64);
-typedef LtStartStream = int Function(Pointer<LtSessionOpaque>, int, int, int);
+    Int64 Function(
+      Pointer<LtSessionOpaque>,
+      Int64,
+      Int32,
+      Int64,
+      Pointer<LtStreamConfig>,
+    );
+typedef LtStartStream =
+    int Function(Pointer<LtSessionOpaque>, int, int, int, Pointer<LtStreamConfig>);
 
 typedef _StopStreamN = Void Function(Pointer<LtSessionOpaque>, Int64);
 typedef LtStopStream = void Function(Pointer<LtSessionOpaque>, int);

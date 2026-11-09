@@ -211,6 +211,85 @@ class StreamInfo {
       'buffer=${bufferSeconds.toStringAsFixed(1)}s, peers=$activePeers)';
 }
 
+/// How an HTTP stream prioritizes pieces around the player's position.
+///
+/// Pieces ahead of the reader form a sliding window that moves each time
+/// the reader enters a piece. The first [criticalBytes] of it are top
+/// priority with deadlines; the rest of the window ranks just below, so the
+/// swarm keeps requests flowing without spreading bandwidth over pieces the
+/// player does not need yet (a piece is readable only once complete).
+/// Reads in the file's tail, where containers keep their index, are probes
+/// and leave the window where it is.
+///
+/// The defaults suit video from typical swarms, including 16 MiB pieces.
+class StreamingConfig {
+  /// Creates a configuration; every field defaults to the tuned value.
+  const StreamingConfig({
+    this.windowBytes = 24 * 1024 * 1024,
+    this.minWindowPieces = 2,
+    this.maxWindowPieces = 48,
+    this.criticalBytes = 8 * 1024 * 1024,
+    this.tailProbeFraction = 0.02,
+    this.tailProbeMinBytes = 4 * 1024 * 1024,
+    this.tailProbeMaxBytes = 32 * 1024 * 1024,
+  }) : assert(windowBytes > 0),
+       assert(minWindowPieces > 0 && maxWindowPieces >= minWindowPieces),
+       assert(criticalBytes > 0),
+       assert(tailProbeFraction > 0 && tailProbeFraction <= 1),
+       assert(tailProbeMinBytes > 0 && tailProbeMaxBytes >= tailProbeMinBytes);
+
+  /// Size of the window ahead of the reader (default 24 MiB), converted to
+  /// whole pieces and clamped to [minWindowPieces]–[maxWindowPieces].
+  final int windowBytes;
+
+  /// Fewest pieces in the window, however large pieces are (default 2).
+  final int minWindowPieces;
+
+  /// Most pieces in the window, however small pieces are (default 48).
+  final int maxWindowPieces;
+
+  /// Leading part of the window that is top priority with deadlines
+  /// (default 8 MiB); always at least one piece. A new stream gives the
+  /// first [criticalBytes] of the file and its last piece deadlines.
+  final int criticalBytes;
+
+  /// Share of the file at its end treated as the tail (default 0.02, i.e.
+  /// 2%), clamped to [tailProbeMinBytes]–[tailProbeMaxBytes].
+  final double tailProbeFraction;
+
+  /// Smallest tail region (default 4 MiB).
+  final int tailProbeMinBytes;
+
+  /// Largest tail region (default 32 MiB).
+  final int tailProbeMaxBytes;
+
+  /// A copy with the given fields replaced.
+  StreamingConfig copyWith({
+    int? windowBytes,
+    int? minWindowPieces,
+    int? maxWindowPieces,
+    int? criticalBytes,
+    double? tailProbeFraction,
+    int? tailProbeMinBytes,
+    int? tailProbeMaxBytes,
+  }) => StreamingConfig(
+    windowBytes: windowBytes ?? this.windowBytes,
+    minWindowPieces: minWindowPieces ?? this.minWindowPieces,
+    maxWindowPieces: maxWindowPieces ?? this.maxWindowPieces,
+    criticalBytes: criticalBytes ?? this.criticalBytes,
+    tailProbeFraction: tailProbeFraction ?? this.tailProbeFraction,
+    tailProbeMinBytes: tailProbeMinBytes ?? this.tailProbeMinBytes,
+    tailProbeMaxBytes: tailProbeMaxBytes ?? this.tailProbeMaxBytes,
+  );
+
+  @override
+  String toString() =>
+      'StreamingConfig(window=$windowBytes B [$minWindowPieces–'
+      '$maxWindowPieces pieces], critical=$criticalBytes B, '
+      'tail=${tailProbeFraction * 100}% [$tailProbeMinBytes–'
+      '$tailProbeMaxBytes B])';
+}
+
 // ─── Formatting Utilities ─────────────────────────────────────────────────────
 
 /// Format [bytes] as a human-readable string (e.g. "1.5 GB").
