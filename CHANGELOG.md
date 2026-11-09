@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- Windows: the prebuilt DLL and the documented vcpkg setup move to vcpkg
+  2026.10.16, so Windows gets libtorrent 2.1.2 and OpenSSL 3.6.5 (were
+  2.1.1 and 3.6.4), the same versions as macOS and Linux. libtorrent 2.1.2
+  no longer loses file priority updates issued in quick succession.
+
 ## 0.1.0
 
 First release as melon_libtorrent, forked from

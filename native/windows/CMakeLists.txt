@@ -9,8 +9,8 @@ if(POLICY CMP0135)
 endif()
 include(FetchContent)
 FetchContent_Declare(vcpkg
-  URL https://github.com/microsoft/vcpkg/archive/04a9d8e5212d01ee1dd9478eadd9caade4f8b0d4.tar.gz
-  URL_HASH SHA256=6c4b4bd1e2d6b1598ff001be73cd90bd596f687d9243377061b06b5b81815a24
+  URL https://github.com/microsoft/vcpkg/archive/9eec002df1cd109f8f104cd966a763daf9751489.tar.gz
+  URL_HASH SHA256=0e41e3fc97abf18bd84f52e711eff88ba88726aa316c4f0f41d5bbd7d7b4690e
 )
 FetchContent_MakeAvailable(vcpkg)
 set(CMAKE_TOOLCHAIN_FILE "${vcpkg_SOURCE_DIR}/scripts/buildsystems/vcpkg.cmake" CACHE FILEPATH "Native dependencies")

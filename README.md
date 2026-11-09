@@ -34,7 +34,7 @@ assets (build hooks).
 
 ```yaml
 dependencies:
-  melon_libtorrent: ^0.1.0
+  melon_libtorrent: ^0.1.1
 ```
 
 On macOS, a sandboxed app needs both network entitlements in
@@ -219,8 +219,8 @@ bridge sources.
   ```cmake
   include(FetchContent)
   FetchContent_Declare(vcpkg
-    URL https://github.com/microsoft/vcpkg/archive/04a9d8e5212d01ee1dd9478eadd9caade4f8b0d4.tar.gz
-    URL_HASH SHA256=6c4b4bd1e2d6b1598ff001be73cd90bd596f687d9243377061b06b5b81815a24
+    URL https://github.com/microsoft/vcpkg/archive/9eec002df1cd109f8f104cd966a763daf9751489.tar.gz
+    URL_HASH SHA256=0e41e3fc97abf18bd84f52e711eff88ba88726aa316c4f0f41d5bbd7d7b4690e
   )
   FetchContent_MakeAvailable(vcpkg)
   set(CMAKE_TOOLCHAIN_FILE "${vcpkg_SOURCE_DIR}/scripts/buildsystems/vcpkg.cmake" CACHE FILEPATH "")
@@ -242,9 +242,10 @@ bridge sources.
   }
   ```
 
-  At this vcpkg commit that is libtorrent 2.1.1 and OpenSSL 3.6.4; vcpkg
-  builds them (about 15 minutes the first time). The prebuilt Windows DLL
-  is built exactly this way (`native/windows/`).
+  This vcpkg release (2026.10.16) has libtorrent 2.1.2 and OpenSSL 3.6.5,
+  the same versions as the macOS and Linux builds; vcpkg builds them
+  (about 15 minutes the first time). The prebuilt Windows DLL is built
+  exactly this way (`native/windows/`).
 
 The macOS and Linux builds include libtorrent's WebTorrent support
 (libdatachannel and libjuice); the Windows build does not.

@@ -2,7 +2,7 @@ name: melon_libtorrent
 description: >-
   libtorrent 2.1 bindings for Flutter desktop (macOS, Windows, Linux) with a
   built-in HTTP streaming server for playing torrents while they download.
-version: 0.1.0
+version: 0.1.1
 repository: https://github.com/shirumesu/melon_libtorrent
 issue_tracker: https://github.com/shirumesu/melon_libtorrent/issues
 topics:
