@@ -63,12 +63,13 @@ client. Desktop only: macOS, Windows and Linux.
 
 - Renamed: package and library `melon_libtorrent`
   (`package:melon_libtorrent/melon_libtorrent.dart`).
-- `LibtorrentFlutter.init` gains `userAgent`, `peerFingerprint` and
+- Renamed: the main class is `MelonLibtorrent` (was `LibtorrentFlutter`).
+- `MelonLibtorrent.init` gains `userAgent`, `peerFingerprint` and
   `handshakeClientVersion` (libtorrent's defaults when null),
   `fallbackTrackers` (the public trackers added to magnets without any,
   formerly hard-coded) and `streaming`.
 - `init(fetchTrackers:)` now defaults to false.
-- `startStream` gains `streaming`; `LibtorrentFlutter.streamingConfig`
+- `startStream` gains `streaming`; `MelonLibtorrent.streamingConfig`
   holds the session default.
 - `dispose` keeps downloaded files; a `NativeFinalizer` destroys the
   session when the isolate shuts down without `dispose` (hot restart).

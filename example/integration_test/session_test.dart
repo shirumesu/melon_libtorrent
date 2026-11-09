@@ -13,13 +13,13 @@ void main() {
     final directory = await Directory.systemTemp.createTemp('melon_lt_test');
     addTearDown(() => directory.delete(recursive: true));
 
-    await LibtorrentFlutter.init(
+    await MelonLibtorrent.init(
       defaultSavePath: directory.path,
       userAgent: 'melon_libtorrent_test/0.1.0',
       peerFingerprint: '-ML0100-',
       pollInterval: const Duration(milliseconds: 100),
     );
-    final engine = LibtorrentFlutter.instance;
+    final engine = MelonLibtorrent.instance;
     expect(engine.libraryVersion, startsWith('2.'));
 
     // The info-hash of a well-known public torrent; no peers are needed.
@@ -45,6 +45,6 @@ void main() {
     engine.configureSession(const BtConfig(connectionsLimit: 10));
     engine.removeTorrent(id);
     await engine.dispose();
-    expect(LibtorrentFlutter.isInitialized, isFalse);
+    expect(MelonLibtorrent.isInitialized, isFalse);
   });
 }

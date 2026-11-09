@@ -52,11 +52,11 @@ and the streaming server.
 ```dart
 import 'package:melon_libtorrent/melon_libtorrent.dart';
 
-await LibtorrentFlutter.init(
+await MelonLibtorrent.init(
   defaultSavePath: '/path/to/downloads',
   userAgent: 'MyApp/1.0',
 );
-final engine = LibtorrentFlutter.instance;
+final engine = MelonLibtorrent.instance;
 
 final id = engine.addMagnet('magnet:?xt=urn:btih:…');
 engine.torrentUpdates.listen((torrents) {
@@ -80,7 +80,7 @@ await engine.dispose();
 
 ## Usage
 
-`LibtorrentFlutter` holds one libtorrent session per isolate. Status is
+`MelonLibtorrent` holds one libtorrent session per isolate. Status is
 polled (every 600 ms by default) and emitted on `torrentUpdates` on every
 poll, idle seeders included; `torrents` is the latest snapshot.
 
@@ -145,7 +145,7 @@ frame; with the default split it took 51 s.
 | `userAgent` | libtorrent's (`libtorrent/2.1.2`) | Client name sent to HTTP trackers and web seeds |
 | `peerFingerprint` | libtorrent's (`-LT2120-`) | Peer-id prefix, Azureus style `-XXvvvv-` |
 | `handshakeClientVersion` | the user agent | Client name in the extension handshake |
-| `fallbackTrackers` | `LibtorrentFlutter.defaultFallbackTrackers` (8 public UDP trackers) | Added to magnets that name no tracker; `[]` disables |
+| `fallbackTrackers` | `MelonLibtorrent.defaultFallbackTrackers` (8 public UDP trackers) | Added to magnets that name no tracker; `[]` disables |
 | `fetchTrackers` | `false` | Download ngosang's trackers_best.txt from GitHub at startup and add it to every magnet |
 | `streaming` | `StreamingConfig()` | Default playback window |
 

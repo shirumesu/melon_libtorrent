@@ -11,7 +11,7 @@ Future<void> main() async {
     '${Directory.systemTemp.path}/melon_libtorrent_example',
   );
   await downloads.create(recursive: true);
-  await LibtorrentFlutter.init(
+  await MelonLibtorrent.init(
     defaultSavePath: downloads.path,
     userAgent: 'melon_libtorrent_example/1.0',
   );
@@ -37,7 +37,7 @@ class TorrentsPage extends StatefulWidget {
 }
 
 class _TorrentsPageState extends State<TorrentsPage> {
-  final _engine = LibtorrentFlutter.instance;
+  final _engine = MelonLibtorrent.instance;
   final _input = TextEditingController();
   late final StreamSubscription<void> _updates;
 

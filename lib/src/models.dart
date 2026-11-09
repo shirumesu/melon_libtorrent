@@ -130,7 +130,7 @@ extension TorrentStateX on TorrentState {
 }
 
 /// A snapshot of one torrent, emitted by
-/// [LibtorrentFlutter.torrentUpdates] on every poll.
+/// [MelonLibtorrent.torrentUpdates] on every poll.
 class TorrentInfo {
   /// Handle returned by the add call; valid until the torrent is removed.
   final int id;
@@ -280,10 +280,10 @@ class TorrentInfo {
       'progress=${(progress * 100).toStringAsFixed(1)}%)';
 }
 
-/// A file within a torrent, from [LibtorrentFlutter.getFiles].
+/// A file within a torrent, from [MelonLibtorrent.getFiles].
 class FileInfo {
-  /// Index of the file in the torrent, as used by [LibtorrentFlutter.startStream]
-  /// and [LibtorrentFlutter.setFilePriorities].
+  /// Index of the file in the torrent, as used by [MelonLibtorrent.startStream]
+  /// and [MelonLibtorrent.setFilePriorities].
   final int index;
 
   /// File name, as renamed on disk.
@@ -317,10 +317,10 @@ class FileInfo {
       'size=$size, streamable=$isStreamable)';
 }
 
-/// An HTTP stream of one file, from [LibtorrentFlutter.startStream] and
-/// [LibtorrentFlutter.streamUpdates].
+/// An HTTP stream of one file, from [MelonLibtorrent.startStream] and
+/// [MelonLibtorrent.streamUpdates].
 class StreamInfo {
-  /// Stream handle for [LibtorrentFlutter.stopStream].
+  /// Stream handle for [MelonLibtorrent.stopStream].
   final int id;
 
   /// The streamed torrent.

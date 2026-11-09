@@ -1,4 +1,4 @@
-// LibtorrentFlutter — Main engine class.
+// MelonLibtorrent — Main engine class.
 // Manages a libtorrent session with automatic tracker injection,
 // status polling, and a built-in HTTP streaming server.
 
@@ -16,8 +16,8 @@ import 'models.dart';
 
 /// Fetches a public tracker list and adds it to magnet URIs.
 ///
-/// [LibtorrentFlutter.init] calls [fetchBestTrackers] when `fetchTrackers`
-/// is true, and [LibtorrentFlutter.addMagnet] always passes magnets through
+/// [MelonLibtorrent.init] calls [fetchBestTrackers] when `fetchTrackers`
+/// is true, and [MelonLibtorrent.addMagnet] always passes magnets through
 /// [injectTrackers], which leaves them unchanged until a list was fetched.
 class TrackerManager {
   static final List<String> _extraTrackers = [];
@@ -111,13 +111,13 @@ StreamInfo _toStreamInfo(LtStreamStatus s) => StreamInfo(
   downloadRate: s.downloadRate,
 );
 
-// ─── LibtorrentFlutter ──────────────────────────────────────────────────────
+// ─── MelonLibtorrent ──────────────────────────────────────────────────────
 
 /// The libtorrent session of this isolate.
 ///
 /// ```dart
-/// await LibtorrentFlutter.init(userAgent: 'MyApp/1.0');
-/// final engine = LibtorrentFlutter.instance;
+/// await MelonLibtorrent.init(userAgent: 'MyApp/1.0');
+/// final engine = MelonLibtorrent.instance;
 /// final id = engine.addMagnet(magnetUri, savePath);
 /// engine.torrentUpdates.listen((torrents) => print(torrents[id]));
 /// // Once torrents[id].hasMetadata:
@@ -132,8 +132,8 @@ StreamInfo _toStreamInfo(LtStreamStatus s) => StreamInfo(
 /// changed. If the isolate shuts down without [dispose] (for example on
 /// hot restart), a finalizer still destroys the native session; downloaded
 /// files are kept either way.
-class LibtorrentFlutter implements Finalizable {
-  static LibtorrentFlutter? _instance;
+class MelonLibtorrent implements Finalizable {
+  static MelonLibtorrent? _instance;
 
   late final TorrentBridgeBindings _b;
   late final Pointer<LtSessionOpaque> _session;
@@ -156,12 +156,12 @@ class LibtorrentFlutter implements Finalizable {
   static const _maxTorrents = 1024;
   static const _maxStreams = 64;
 
-  LibtorrentFlutter._();
+  MelonLibtorrent._();
 
   /// The singleton instance. Only available after [init] completes.
-  static LibtorrentFlutter get instance {
+  static MelonLibtorrent get instance {
     return _instance ??
-        (throw StateError('LibtorrentFlutter.init() not called'));
+        (throw StateError('MelonLibtorrent.init() not called'));
   }
 
   /// Whether the engine has been initialized.
@@ -218,7 +218,7 @@ class LibtorrentFlutter implements Finalizable {
     StreamingConfig streaming = const StreamingConfig(),
   }) async {
     if (_instance != null) return;
-    final engine = LibtorrentFlutter._();
+    final engine = MelonLibtorrent._();
 
     // Fetch best trackers in background (fire & forget)
     if (fetchTrackers) {
