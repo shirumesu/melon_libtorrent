@@ -16,7 +16,11 @@ import 'models.dart';
 
 // ─── Tracker Management ─────────────────────────────────────────────────────
 
-/// Automatically fetches and injects best public trackers into magnet URIs.
+/// Fetches a public tracker list and adds it to magnet URIs.
+///
+/// [LibtorrentFlutter.init] calls [fetchBestTrackers] when `fetchTrackers`
+/// is true, and [LibtorrentFlutter.addMagnet] always passes magnets through
+/// [injectTrackers], which leaves them unchanged until a list was fetched.
 class TrackerManager {
   static final List<String> _extraTrackers = [];
 
@@ -175,8 +179,10 @@ class LibtorrentFlutter implements Finalizable {
   ///   interfaces, any port). [configureSession] replaces it.
   /// - [downloadLimit] / [uploadLimit] — speed limits in bytes/sec (0 = unlimited).
   /// - [pollInterval] — how often to poll for torrent/stream status updates.
-  /// - [fetchTrackers] — fetch a public tracker list on startup and add it
-  ///   to every magnet added afterwards (see [TrackerManager]).
+  /// - [fetchTrackers] — fetch ngosang's public tracker list from GitHub on
+  ///   startup and add it to every magnet added afterwards (see
+  ///   [TrackerManager]). Off by default: it contacts a third-party host and
+  ///   changes the trackers of every magnet.
   /// - [defaultSavePath] — where to save torrent data. Defaults to system temp dir.
   /// - [userAgent] — the client name sent to HTTP trackers and web seeds,
   ///   for example `MyApp/1.2`. Null keeps libtorrent's
@@ -196,7 +202,7 @@ class LibtorrentFlutter implements Finalizable {
     int downloadLimit = 0,
     int uploadLimit = 0,
     Duration pollInterval = const Duration(milliseconds: 600),
-    bool fetchTrackers = true,
+    bool fetchTrackers = false,
     String? defaultSavePath,
     String? userAgent,
     String? peerFingerprint,
