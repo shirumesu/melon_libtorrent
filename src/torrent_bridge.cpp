@@ -98,40 +98,35 @@
 #include <cinttypes>
 #include <functional>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace lt  = libtorrent;
 namespace chr = std::chrono;
 
 // ── debug logging ───────────────────────────────────────────────────────────────
+// Streaming traces go to the file named by MELON_LIBTORRENT_LOG, read once
+// when the first trace is written; without it nothing is logged. (Upstream
+// always wrote torrent_bridge.log in the temporary directory.)
 static FILE* g_logfile = nullptr;
+static std::once_flag g_log_once;
 static std::mutex g_log_mu;
 
-static void tb_log_init() {
-    if (!g_logfile) {
-#ifdef _WIN32
-        char tmp[MAX_PATH];
-        GetTempPathA(MAX_PATH, tmp);
-        std::string path = std::string(tmp) + "torrent_bridge.log";
-        g_logfile = fopen(path.c_str(), "w");
-#elif defined(__ANDROID__)
-        g_logfile = nullptr; // Android uses __android_log_print instead
-#else
-        g_logfile = fopen("/tmp/torrent_bridge.log", "w");
-#endif
-        if (g_logfile) {
-            setvbuf(g_logfile, nullptr, _IONBF, 0);
-        }
-    }
+static FILE* tb_log_file() {
+    std::call_once(g_log_once, [] {
+        const char* path = std::getenv("MELON_LIBTORRENT_LOG");
+        if (path && *path) g_logfile = std::fopen(path, "w");
+        if (g_logfile) setvbuf(g_logfile, nullptr, _IONBF, 0);
+    });
+    return g_logfile;
 }
 
 #define TB_LOG(fmt, ...) do { \
-    std::lock_guard<std::mutex> _lk(g_log_mu); \
-    tb_log_init(); \
-    if (g_logfile) { \
+    if (FILE* _f = tb_log_file()) { \
+        std::lock_guard<std::mutex> _lk(g_log_mu); \
         auto _now = chr::steady_clock::now(); \
         auto _ms = chr::duration_cast<chr::milliseconds>(_now.time_since_epoch()).count() % 100000; \
-        fprintf(g_logfile, "[%05lld] " fmt "\n", (long long)_ms, ##__VA_ARGS__); \
+        fprintf(_f, "[%05lld] " fmt "\n", (long long)_ms, ##__VA_ARGS__); \
     } \
 } while(0)
 
