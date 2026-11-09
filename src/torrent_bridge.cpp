@@ -29,6 +29,12 @@
 #include <openssl/ssl.h>
 #endif
 
+#include <libtorrent/load_torrent.hpp>
+#include <libtorrent/write_resume_data.hpp>
+#include <libtorrent/read_resume_data.hpp>
+#include <fstream>
+#include <iterator>
+#include <filesystem>
 #include <libtorrent/session.hpp>
 #include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
@@ -78,6 +84,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
+#include <map>
 #include <string>
 #include <sstream>
 #include <iomanip>
@@ -85,6 +92,7 @@
 #include <deque>
 #include <memory>
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cstring>
 #include <cinttypes>
@@ -221,7 +229,16 @@ static void fill_status(lt_torrent_status& out, int64_t id,
                         const lt::torrent_status& st)
 {
     out.id    = id;
-    out.state = static_cast<int32_t>(st.state);
+    // The C ABI enum is compact; libtorrent retains deprecated numeric slots.
+    switch (st.state) {
+        case lt::torrent_status::checking_files: out.state = LT_STATE_CHECKING_FILES; break;
+        case lt::torrent_status::downloading_metadata: out.state = LT_STATE_DOWNLOADING_META; break;
+        case lt::torrent_status::downloading: out.state = LT_STATE_DOWNLOADING; break;
+        case lt::torrent_status::finished: out.state = LT_STATE_FINISHED; break;
+        case lt::torrent_status::seeding: out.state = LT_STATE_SEEDING; break;
+        case lt::torrent_status::checking_resume_data: out.state = LT_STATE_CHECKING_RESUME; break;
+        default: out.state = LT_STATE_UNKNOWN; break;
+    }
 
     if ((st.state == lt::torrent_status::finished ||
          st.state == lt::torrent_status::seeding) && st.progress < 0.999f)
@@ -237,16 +254,7 @@ static void fill_status(lt_torrent_status& out, int64_t id,
     out.num_seeds     = st.num_seeds;
     out.num_pieces    = (int32_t)st.num_pieces;
 
-    int have = 0;
-    if (st.has_metadata && !st.pieces.empty() && st.pieces.size() > 0) {
-        int sz = static_cast<int>(st.pieces.size());
-        for (int i = 0; i < sz; ++i) {
-            try {
-                if (st.pieces.get_bit(lt::piece_index_t(i))) have++;
-            } catch (...) { break; }
-        }
-    }
-    out.pieces_done = (int32_t)have;
+    out.pieces_done = st.num_pieces;
 
     out.is_paused   = (st.flags & lt::torrent_flags::paused) ? 1 : 0;
     out.is_finished = (st.progress >= 0.999f && st.is_finished) ? 1 : 0;
@@ -254,6 +262,24 @@ static void fill_status(lt_torrent_status& out, int64_t id,
 
     int qp = static_cast<int>(st.queue_position);
     out.queue_position = (qp < 0) ? -1 : qp;
+    out.known_peers = st.list_peers;
+    out.tracker_count = 0;
+    out.working_trackers = 0;
+    out.failed_trackers = 0;
+    for (const auto& tracker : st.handle.trackers()) {
+        ++out.tracker_count;
+        bool working = false, failed = false;
+        for (const auto& endpoint : tracker.endpoints) {
+            if (!endpoint.enabled) continue;
+            for (const auto& hash : endpoint.info_hashes) {
+                working = working || (hash.start_sent && !hash.last_error);
+                failed = failed || bool(hash.last_error);
+            }
+        }
+        // An unavailable interface must not hide a successful route.
+        if (working) ++out.working_trackers;
+        else if (failed) ++out.failed_trackers;
+    }
 
     std::string name = st.name;
     if (st.has_metadata) {
@@ -834,6 +860,7 @@ struct StreamEngine {
     lt_stream_id  id;
     lt_torrent_id torrent_id;
     int           file_index;
+    bool          background_download = true;
 
     lt::torrent_handle                      handle;
     std::shared_ptr<const lt::torrent_info> ti;
@@ -856,10 +883,27 @@ struct StreamEngine {
     // readahead fixed at 16MB like TorrServer — port of torrent.go updateRA()
     static constexpr int64_t FIXED_READAHEAD = 16 * 1024 * 1024;
 
-    // 8MB head/tail for container metadata — port of isIdInFileBE's FileRangeNotDelete
-    static constexpr int64_t PROTECT_BYTES = 8 * 1024 * 1024;
-    int head_end_piece;
-    int tail_start_piece;
+    // Pieces ahead of the read head carry deadlines, so the swarm keeps the
+    // playback window full instead of starting a piece when the reader
+    // blocks on it. Only the first CRITICAL_BYTES are top priority: a piece
+    // completes only when all of it has arrived, and the swarm spreads its
+    // requests over every top-priority piece, so with large pieces (16 MB in
+    // season batches) a wider top window finishes all of them at once, long
+    // after the one under the reader could have.
+    static constexpr int64_t WINDOW_BYTES = 24 * 1024 * 1024;
+    static constexpr int64_t CRITICAL_BYTES = 8 * 1024 * 1024;
+    int window_pieces = 8;
+    int critical_pieces = 1;
+    int window_head = -1;
+    std::set<int> window_set;
+    std::mutex window_mu;
+
+    // The rest of a cached torrent keeps downloading behind the stream, below
+    // everything the reader needs; it returns to normal priority when the
+    // stream stops.
+    lt::download_priority_t background_priority() const {
+        return background_download ? lt::low_priority : lt::dont_download;
+    }
 
     // HTTP server
     std::thread       server_thread;
@@ -903,11 +947,21 @@ struct StreamEngine {
     std::deque<int>  trailing_pieces;
     std::mutex       trailing_mu;
 
-    // adaptive bitrate estimate (bytes/sec) — derived from file size
+    // bitrate estimate (bytes/sec) for buffer_seconds — derived from file size
     float estimated_bitrate_bps = 625000.0f;
-    int   critical_startup_pieces = 2;  // computed at init
 
     std::atomic<bool> active{true};
+
+    // Container probes read the index at the end of the file (MKV cues, an
+    // MP4 index written last) and must not drag the playback window there.
+    // The region is a few MB rather than a count of pieces: ten 16 MB pieces
+    // are most of an episode, and a resume read there was taken for a probe,
+    // so the window stayed on the header and the resume point never came.
+    bool is_tail_probe(int64_t off) const {
+        const int64_t tail = std::clamp(
+            file_size / 50, (int64_t)4 << 20, (int64_t)32 << 20);
+        return off > file_size - tail;
+    }
 
     int byte_to_piece(int64_t off) const {
         if (piece_length <= 0) return start_piece;
@@ -991,7 +1045,11 @@ struct StreamEngine {
             }
         }
 
-        read_cv.notify_all();
+        {
+            // Cache completion also satisfies read waiters after a shared result is consumed.
+            std::lock_guard<std::mutex> lk(read_mu);
+            read_cv.notify_all();
+        }
         piece_cv.notify_all();
     }
 
@@ -1035,6 +1093,7 @@ struct SessionWrapper {
     // alert thread — sole consumer of session.pop_alerts()
     std::thread       alert_thread;
     std::atomic<bool> alert_running{false};
+    std::atomic<int> dht_nodes{0};
 
     // push callback (called from alert thread)
     lt_alert_callback  dart_callback  = nullptr;
@@ -1084,8 +1143,14 @@ struct SessionWrapper {
     }
 
     void process_alerts() {
+        auto next_dht_stats = chr::steady_clock::now();
+        std::map<lt::sha1_hash, int> dht_routing_sizes;
         while (alert_running.load()) {
             try {
+                if (chr::steady_clock::now() >= next_dht_stats) {
+                    session.post_dht_stats();
+                    next_dht_stats = chr::steady_clock::now() + chr::seconds(5);
+                }
                 if (!session.wait_for_alert(lt::milliseconds(100)))
                     continue;
                 std::vector<lt::alert*> alerts;
@@ -1094,6 +1159,18 @@ struct SessionWrapper {
                 for (auto* a : alerts) {
                     if (!a) continue;
                     try {
+                        if (auto* stats = lt::alert_cast<lt::dht_stats_alert>(a)) {
+                            int nodes = 0;
+                            for (const auto& bucket : stats->routing_table)
+                                nodes += bucket.num_nodes;
+                            dht_routing_sizes[stats->nid] = nodes;
+                            // Interfaces often know the same nodes; do not add them twice.
+                            int largest = 0;
+                            for (const auto& size : dht_routing_sizes)
+                                largest = std::max(largest, size.second);
+                            dht_nodes.store(largest);
+                            continue;
+                        }
                         // read_piece_alert → route to stream's cache
                         if (auto* rpa = lt::alert_cast<lt::read_piece_alert>(a)) {
                             int p = static_cast<int>(rpa->piece);
@@ -1148,7 +1225,7 @@ struct SessionWrapper {
                                 try {
                                     auto ti = mra->handle.torrent_file();
                                     if (ti) {
-                                        int nf = ti->files().num_files();
+                                        int nf = ti->num_files();
                                         std::vector<lt::download_priority_t> p(
                                             (size_t)nf, lt::dont_download);
                                         mra->handle.prioritize_files(p);
@@ -1213,24 +1290,65 @@ static bool wait_for_piece(StreamEngine* s, int piece, int timeout_ms,
         && s->pieces_have.count(piece) > 0;
 }
 
+// Moves the deadline window to start at [head]. The time-critical picker
+// orders by deadline, so the piece under the reader comes first; the pieces
+// after the critical ones rank just below, keeping peer request queues full
+// without taking bandwidth from it. Pieces of the previous window that the
+// new one leaves (after a seek) drop back to the background.
+static void refresh_window(StreamEngine* s, int head) {
+    std::lock_guard<std::mutex> wlk(s->window_mu);
+    if (head == s->window_head) return;
+    s->window_head = head;
+    std::lock_guard<std::mutex> lk(s->piece_mu);
+    std::set<int> window;
+    for (int i = 0; i < s->window_pieces && head + i <= s->end_piece; ++i) {
+        int p = head + i;
+        if (s->pieces_have.count(p)) continue;
+        window.insert(p);
+        try {
+            if (i < s->critical_pieces) {
+                s->handle.piece_priority(lt::piece_index_t(p), lt::top_priority);
+                s->handle.set_piece_deadline(lt::piece_index_t(p), i * 100);
+            } else {
+                s->handle.piece_priority(
+                    lt::piece_index_t(p), lt::download_priority_t{6});
+            }
+        } catch (...) {}
+    }
+    for (int p : s->window_set) {
+        if (window.count(p) || s->pieces_have.count(p)) continue;
+        try {
+            s->handle.reset_piece_deadline(lt::piece_index_t(p));
+            s->handle.piece_priority(lt::piece_index_t(p), s->background_priority());
+        } catch (...) {}
+    }
+    s->window_set = std::move(window);
+}
+
 // Read piece data directly from libtorrent disk storage.
 // Like lt2http: storage()->readv() — reads downloaded piece data.
 static ReadResult read_piece_data(StreamEngine* s, int piece,
                                   int timeout_ms = 5000, int gen = -1) {
     if (gen < 0) gen = s->seek_generation.load();
 
-    // Check hot piece cache first — instant for re-reads
-    if (s->cache) {
-        auto* cp = s->cache->get_piece(piece);
-        if (cp) {
-            std::shared_lock<std::shared_mutex> lk(cp->mu);
-            if (!cp->buffer.empty() && cp->complete) {
-                ReadResult r;
-                r.data.assign(cp->buffer.begin(), cp->buffer.end());
-                r.ok = true;
-                return r;
+    auto* cached = s->cache ? s->cache->get_piece(piece) : nullptr;
+    const auto copy_cached = [cached]() {
+        ReadResult result;
+        if (cached) {
+            std::shared_lock<std::shared_mutex> lk(cached->mu);
+            if (!cached->buffer.empty() && cached->complete) {
+                result.data = cached->buffer;
+                result.ok = true;
             }
         }
+        return result;
+    };
+
+    // Consume duplicate prefetch results even when the hot cache answers first.
+    if (auto result = copy_cached(); result.ok) {
+        std::lock_guard<std::mutex> lk(s->read_mu);
+        s->read_results.erase(piece);
+        return result;
     }
 
     // Check if we already have a read result buffered
@@ -1254,13 +1372,20 @@ static ReadResult read_piece_data(StreamEngine* s, int piece,
     if (s->read_cv.wait_for(lk, chr::milliseconds(timeout_ms),
             [&]{ return !s->active.load()
                      || s->read_results.count(piece) > 0
-                     || s->seek_generation.load() != gen; })) {
+                     || s->seek_generation.load() != gen
+                     || (cached && [&] {
+                            std::shared_lock<std::shared_mutex> cache_lk(cached->mu);
+                            return cached->complete && !cached->buffer.empty();
+                        }()); })) {
         auto it = s->read_results.find(piece);
         if (it != s->read_results.end()) {
             ReadResult r = std::move(it->second);
             s->read_results.erase(it);
             return r;
         }
+        // Another HTTP reader may have consumed the same completed disk read.
+        lk.unlock();
+        return copy_cached();
     }
     return {};
 }
@@ -1326,7 +1451,7 @@ static bool serve_range(StreamEngine* s, TorrReader* reader, socket_t cli,
     int64_t cursor = range_start;
     TB_LOG("serve_range: start=%lld end=%lld gen=%d", (long long)range_start, (long long)range_end, my_gen);
 
-    bool is_tail = (range_start > s->file_size - s->piece_length * 10);
+    bool is_tail = s->is_tail_probe(range_start);
 
     if (!is_tail) {
         reader->offset = range_start;
@@ -1347,8 +1472,9 @@ static bool serve_range(StreamEngine* s, TorrReader* reader, socket_t cli,
         int64_t send_end = std::min(range_end, pfend);
         if (send_end < sbeg) { cursor = pfend + 1; continue; }
 
-        // ── lt2http pattern: prioritize current + 2 ahead, then wait ──
-        // Like lt2http's Reader::wait_for_piece → prioritize_pieces(start, start+2)
+        // Container probes near the end must not drag the window there.
+        if (!is_tail) refresh_window(s, p);
+
         bool have_it = false;
         {
             std::lock_guard<std::mutex> lk(s->piece_mu);
@@ -1356,30 +1482,11 @@ static bool serve_range(StreamEngine* s, TorrReader* reader, socket_t cli,
         }
 
         if (!have_it) {
-            // Wider deadline pipeline: current + 16 pieces with stagger.
-            // The deadline picker orders by deadline, so i=0 still gets
-            // priority — the extra entries just keep peer request queues
-            // full so the swarm doesn't idle between piece completions.
-            // (Previous current+2 window was below libtorrent's own
-            //  request pipeline depth → peers sat idle after each piece.)
-            constexpr int PIPELINE_AHEAD = 16;
-            TB_LOG("serve_range: piece=%d not ready, prioritizing p..p+%d", p, PIPELINE_AHEAD);
+            TB_LOG("serve_range: piece=%d not ready", p);
             try {
                 s->handle.piece_priority(lt::piece_index_t(p), lt::top_priority);
                 s->handle.set_piece_deadline(lt::piece_index_t(p), 0);
             } catch (...) {}
-            for (int i = 1; i <= PIPELINE_AHEAD && p + i <= s->end_piece; ++i) {
-                bool have_next = false;
-                { std::lock_guard<std::mutex> lk(s->piece_mu); have_next = s->pieces_have.count(p+i) > 0; }
-                if (!have_next) {
-                    try {
-                        // First two stay at top, rest at priority 6
-                        auto pri = (i <= 2) ? lt::top_priority : lt::download_priority_t(6);
-                        s->handle.piece_priority(lt::piece_index_t(p+i), pri);
-                        s->handle.set_piece_deadline(lt::piece_index_t(p+i), i * 80);
-                    } catch (...) {}
-                }
-            }
 
             // Wait for piece — like lt2http's sleep_for(300ms) polling loop
             // but using condition variable for zero-latency wakeup
@@ -1476,7 +1583,7 @@ static bool serve_range(StreamEngine* s, TorrReader* reader, socket_t cli,
                 int old_p = s->trailing_pieces.front();
                 s->trailing_pieces.pop_front();
                 try {
-                    s->handle.piece_priority(lt::piece_index_t(old_p), lt::dont_download);
+                    s->handle.piece_priority(lt::piece_index_t(old_p), s->background_priority());
                 } catch (...) {}
                 // Release cache memory for evicted piece
                 if (s->cache) {
@@ -1603,7 +1710,7 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
             // This stops old time-critical picks without disrupting peer
             // connections (unlike batch-resetting ALL pieces to dont_download).
             int64_t old_head = s->read_head.load();
-            bool is_tail_req = (rstart > fsz - s->piece_length * 10);
+            bool is_tail_req = s->is_tail_probe(rstart);
             TB_LOG("handle_conn: rstart=%lld rend=%lld old_head=%lld is_tail=%d",
                    (long long)rstart, (long long)rend, (long long)old_head, is_tail_req?1:0);
             if (!is_tail_req && old_head > 0 && std::abs(rstart - old_head) > 65536) {
@@ -1638,7 +1745,7 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
                     for (int old_p : s->trailing_pieces) {
                         try {
                             s->handle.piece_priority(
-                                lt::piece_index_t(old_p), lt::dont_download);
+                                lt::piece_index_t(old_p), s->background_priority());
                         } catch (...) {}
                     }
                     s->trailing_pieces.clear();
@@ -1648,8 +1755,8 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
                                             s->start_piece, s->end_piece);
                 try {
                     // Minimal seek path — just unblock the picker, then let
-                    // serve_range do its normal 16-piece + 80ms gradient on
-                    // the very first piece it processes.
+                    // serve_range move its deadline window on the very first
+                    // piece it processes.
                     //
                     // Previous version did prioritize_pieces(full_vec) +
                     // 4-piece window + 300ms stagger. That fought serve_range
@@ -1662,13 +1769,16 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
                     //   2. fire ONE deadline on the seek target so the
                     //      picker pivots NOW, before the first serve_range
                     //      iteration runs (~1ms later)
-                    //   3. force-resume in case the torrent went to seeding
                     s->handle.clear_piece_deadlines();
+                    {
+                        std::lock_guard<std::mutex> wlk(s->window_mu);
+                        s->window_head = -1;
+                    }
                     s->handle.piece_priority(
                         lt::piece_index_t(seek_piece), lt::top_priority);
                     s->handle.set_piece_deadline(
                         lt::piece_index_t(seek_piece), 0);
-                    s->handle.resume();
+                    if (!s->background_download) s->handle.resume();
                     // If the seek target is already on disk, kick a read
                     // immediately so serve_range's read_piece_data returns
                     // without an extra round-trip.
@@ -1679,7 +1789,10 @@ static void handle_connection(StreamEngine* s, socket_t cli, int reader_id) {
             // get filename — port of stream.go MIME detection
             std::string filename = "video.mp4";
             if (s->ti) {
-                try { filename = std::string(s->ti->files().file_name(lt::file_index_t{s->file_index})); }
+                try {
+                    const auto renames = s->handle.get_renamed_files();
+                    filename = std::string(renames.file_name(s->ti->layout(), lt::file_index_t{s->file_index}));
+                }
                 catch (...) {}
             }
 
@@ -1954,135 +2067,16 @@ TORRENT_API lt_session_t lt_create_session(const char* iface, int dl, int ul) {
         sp.set_bool(lt::settings_pack::validate_https_trackers, true);
 #endif
 
-        // ── connection speed — get peers fast ──
-        sp.set_int (lt::settings_pack::connection_speed,          200);
-        sp.set_int (lt::settings_pack::torrent_connect_boost,     200);
-        sp.set_bool(lt::settings_pack::smooth_connects,           false);
-        // Session-wide cap. Per-torrent cap (default 25) is what actually
-        // governs streaming fanout — see set_max_connections() in
-        // lt_start_stream. Keep this comfortably above per-torrent * active.
-        sp.set_int (lt::settings_pack::connections_limit,         200);
-        sp.set_int (lt::settings_pack::min_reconnect_time,        5);
-        sp.set_int (lt::settings_pack::max_failcount,             3);
-        sp.set_int (lt::settings_pack::peer_connect_timeout,      5);
-        sp.set_int (lt::settings_pack::handshake_timeout,         5);
-
-        // ── timeouts — detect slow/stalled peers quickly for streaming ──
-        sp.set_int (lt::settings_pack::piece_timeout,             5);
-        sp.set_int (lt::settings_pack::request_timeout,           5);
-        sp.set_int (lt::settings_pack::peer_timeout,              15);
-        sp.set_int (lt::settings_pack::inactivity_timeout,        15);
-
-        // ── request pipeline — short queue time = fast seek response ──
-        // request_queue_time is SECONDS of outstanding requests per peer.
-        // At 3s, after a priority change peers take up to 3s to drain the
-        // pipe before serving new pieces. 1s = 3x faster seek response.
-        sp.set_int (lt::settings_pack::request_queue_time,        1);
-        sp.set_int (lt::settings_pack::max_out_request_queue,     500);
-        sp.set_int (lt::settings_pack::max_allowed_in_request_queue, 2000);
-
-        // ── piece picking — WE control priorities ──
-        sp.set_bool(lt::settings_pack::auto_sequential,           false);
-        // piece_extent_affinity=true: keep a peer downloading the same
-        // file region instead of jumping. Reduces piece-completion variance
-        // (= stutter). Designed exactly for streaming.
-        sp.set_bool(lt::settings_pack::piece_extent_affinity,     true);
-        // strict_end_game_mode=false: enables block-level duplication on
-        // the trailing edge of in-progress pieces. With strict=true and a
-        // 2-piece window, end-game NEVER triggers — peers sit waiting on a
-        // single slow block. false = duplicate the last blocks across peers.
-        sp.set_bool(lt::settings_pack::strict_end_game_mode,      false);
-        sp.set_bool(lt::settings_pack::prioritize_partial_pieces, true);
-        sp.set_int (lt::settings_pack::initial_picker_threshold,  0);
-
-        // ── disk I/O ──
-        sp.set_int (lt::settings_pack::aio_threads,               4);
-        sp.set_int (lt::settings_pack::hashing_threads,           2);
-        // 64MB lets the disk pipeline absorb burst writes when many peers
-        // deliver simultaneously (common right after a seek).
-        sp.set_int (lt::settings_pack::max_queued_disk_bytes,     64 * 1024 * 1024);
-        sp.set_int (lt::settings_pack::disk_io_read_mode,         lt::settings_pack::enable_os_cache);
-        sp.set_int (lt::settings_pack::disk_io_write_mode,        lt::settings_pack::enable_os_cache);
-        sp.set_int (lt::settings_pack::file_pool_size,            100);
-        sp.set_bool(lt::settings_pack::no_atime_storage,          true);
-
-        // ── upload — unlimited unchoke so peers reciprocate (tit-for-tat) ──
-        sp.set_int (lt::settings_pack::unchoke_slots_limit,       -1);
-        sp.set_int (lt::settings_pack::active_seeds,              0);
-        sp.set_int (lt::settings_pack::suggest_mode,              lt::settings_pack::suggest_read_cache);
-
-        // ── DHT + discovery ──
-        sp.set_bool(lt::settings_pack::enable_dht,                true);
-        sp.set_bool(lt::settings_pack::enable_lsd,                true);
-        sp.set_bool(lt::settings_pack::enable_upnp,               true);
-        sp.set_bool(lt::settings_pack::enable_natpmp,             true);
-        sp.set_str (lt::settings_pack::dht_bootstrap_nodes,
-            "dht.libtorrent.org:25401,"
-            "router.bittorrent.com:6881,"
-            "dht.transmissionbt.com:6881,"
-            "router.utorrent.com:6881");
-        sp.set_int (lt::settings_pack::dht_announce_interval,     60);
-        sp.set_bool(lt::settings_pack::announce_to_all_trackers,  true);
-        sp.set_bool(lt::settings_pack::announce_to_all_tiers,     true);
-
-        // ── general ──
-        sp.set_int (lt::settings_pack::active_downloads,          1);
-        sp.set_int (lt::settings_pack::active_limit,              10);
-        sp.set_int (lt::settings_pack::alert_queue_size,          10000);
-        sp.set_bool(lt::settings_pack::close_redundant_connections, true);
-        sp.set_int (lt::settings_pack::peer_turnover,             5);
-        sp.set_int (lt::settings_pack::peer_turnover_interval,    30);
-        sp.set_bool(lt::settings_pack::no_recheck_incomplete_resume, true);
-        sp.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
-        sp.set_bool(lt::settings_pack::rate_limit_ip_overhead,    false);
-        // whole_pieces_threshold=0: parallelize block requests across peers
-        // for every piece. At 20s, a 4MB piece comes from ONE peer (~800ms
-        // at 5MB/s). Parallel across 10 peers = ~80ms. Single biggest
-        // seek-latency win.
-        sp.set_int (lt::settings_pack::whole_pieces_threshold,    0);
-        sp.set_int (lt::settings_pack::max_peerlist_size,         8000);
-        sp.set_bool(lt::settings_pack::dont_count_slow_torrents,  true);
-
-        // ── encryption (MSE/PE) ──
-        // pe_enabled (vs pe_forced) keeps plaintext as a fallback so we don't
-        // lose peers that don't speak MSE; the encrypted handshake is still
-        // tried first, which is what defeats most ISP DPI throttling.
-        sp.set_int (lt::settings_pack::in_enc_policy,  lt::settings_pack::pe_enabled);
-        sp.set_int (lt::settings_pack::out_enc_policy, lt::settings_pack::pe_enabled);
-        // both = negotiate full RC4 stream encryption when the peer supports
-        // it (header-only is the libtorrent default and is weaker against
-        // DPI). This is the actual ISP-throttling-bypass knob.
-        sp.set_int (lt::settings_pack::allowed_enc_level, lt::settings_pack::pe_both);
-        sp.set_bool(lt::settings_pack::prefer_rc4,         false);
-        sp.set_int (lt::settings_pack::mixed_mode_algorithm, lt::settings_pack::peer_proportional);
-
-        // ── reciprocity boost ──
-        // Announce pieces ~500 ms before they finish hashing so peers can
-        // start requesting from us before we've even completed the piece.
-        // This raises our reciprocity score and gets us better unchoke
-        // priority from them on the next round — measurably helps streaming
-        // on mid-swarm torrents. Value is in MILLISECONDS, not seconds.
-        // 500 ms is enough for ~3-5× a typical WAN round-trip without
-        // announcing pieces that may still fail the hash check.
-        sp.set_int (lt::settings_pack::predictive_piece_announce, 500);
-
-        // ── tracker discovery ──
-        // UDP trackers answer ~10× faster than HTTP and have lower overhead
-        // for the tracker operator (=> more reliable scrape data). Try them
-        // first when both are available.
-        sp.set_bool(lt::settings_pack::prefer_udp_trackers, true);
-
-        // port of btserver.go — spoof as qBittorrent 4.3.9
-        sp.set_str (lt::settings_pack::user_agent,                 "qBittorrent/4.3.9");
-        sp.set_str (lt::settings_pack::peer_fingerprint,           "-qB4390-");
-        sp.set_str (lt::settings_pack::handshake_client_version,   "qBittorrent/4.3.9");
-
-        // buffers
-        sp.set_int (lt::settings_pack::send_buffer_watermark,     2 * 1024 * 1024);
-        sp.set_int (lt::settings_pack::send_buffer_low_watermark, 64 * 1024);
-        sp.set_int (lt::settings_pack::send_buffer_watermark_factor, 150);
-        sp.set_int (lt::settings_pack::recv_socket_buffer_size,   1024 * 1024);
-        sp.set_int (lt::settings_pack::send_socket_buffer_size,   1024 * 1024);
+        // Use libtorrent's tested desktop defaults for transport, disk and
+        // piece picking. Application queue policy is applied per torrent.
+        sp.set_bool(lt::settings_pack::no_recheck_incomplete_resume, false);
+        // Independent tracker tiers may serve different peers. A responsive
+        // empty tier must not block discovery through the remaining tiers.
+        // Keep same-tier fallback and each tracker's announce interval intact.
+        sp.set_bool(lt::settings_pack::announce_to_all_tiers, true);
+        sp.set_str(lt::settings_pack::user_agent, "Melonbang/1.0");
+        sp.set_str(lt::settings_pack::peer_fingerprint, "-MB1000-");
+        sp.set_str(lt::settings_pack::handshake_client_version, "Melonbang/1.0");
 
         // Pin the disk I/O backend explicitly instead of trusting the 2.1.x
         // default (pread_disk_io). The pread backend is new in 2.1.0 and has
@@ -2180,7 +2174,7 @@ TORRENT_API void lt_poll_alerts(lt_session_t session,
 
 TORRENT_API lt_torrent_id lt_add_magnet(lt_session_t session,
                                         const char* uri, const char* path,
-                                        int stream_only) {
+                                        int add_flags) {
     if (!session || !uri || !path) { set_err("null arg"); return -1; }
     auto* sw = to_sw(session);
     try {
@@ -2188,7 +2182,9 @@ TORRENT_API lt_torrent_id lt_add_magnet(lt_session_t session,
         lt::add_torrent_params atp = lt::parse_magnet_uri(uri, ec);
         if (ec) { set_err(ec.message()); return -1; }
         atp.save_path = path;
-        atp.flags &= ~lt::torrent_flags::paused;
+        if (add_flags & 2) atp.flags |= lt::torrent_flags::paused;
+        else atp.flags &= ~lt::torrent_flags::paused;
+        if (add_flags & 4) atp.flags |= lt::torrent_flags::stop_when_ready;
         atp.flags &= ~lt::torrent_flags::auto_managed;
 
         // Trackerless magnet (only an info-hash, no &tr=...)? Seed it with a
@@ -2210,55 +2206,82 @@ TORRENT_API lt_torrent_id lt_add_magnet(lt_session_t session,
             for (auto* t : kDefaultTrackers) atp.trackers.emplace_back(t);
         }
 
-        if (stream_only) {
+        if (add_flags & 1) {
             atp.storage_mode = lt::storage_mode_sparse;
             atp.flags |= lt::torrent_flags::stop_when_ready;
         }
 
         lt::torrent_handle h = sw->session.add_torrent(std::move(atp), ec);
         if (ec) { set_err(ec.message()); return -1; }
-        h.resume();
+        h.set_max_connections(sw->bt_config.connections_limit);
 
         int64_t id = sw->next_id.fetch_add(1);
         {
             std::lock_guard<std::mutex> lk(sw->mu);
             sw->handles[id] = h;
-            if (stream_only) sw->ephemeral_torrents.insert(id);
+            if (add_flags & 1) sw->ephemeral_torrents.insert(id);
         }
         set_err(""); return id;
     } catch (const std::exception& e) { set_err(e.what()); return -1; }
 }
 
+// Adds a torrent read from a .torrent file or from fast-resume data.
+static lt_torrent_id add_params(SessionWrapper* sw, lt::add_torrent_params atp,
+                                const char* path, int add_flags) {
+    lt::error_code ec;
+    atp.save_path = path;
+    if (add_flags & 2) atp.flags |= lt::torrent_flags::paused;
+    else atp.flags &= ~lt::torrent_flags::paused;
+    if (add_flags & 4) atp.flags |= lt::torrent_flags::stop_when_ready;
+    atp.flags &= ~lt::torrent_flags::auto_managed;
+
+    if (add_flags & 1) {
+        atp.storage_mode = lt::storage_mode_sparse;
+        atp.flags |= lt::torrent_flags::stop_when_ready;
+    }
+
+    lt::torrent_handle h = sw->session.add_torrent(std::move(atp), ec);
+    if (ec) { set_err(ec.message()); return -1; }
+    h.set_max_connections(sw->bt_config.connections_limit);
+
+    int64_t id = sw->next_id.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lk(sw->mu);
+        sw->handles[id] = h;
+        if (add_flags & 1) sw->ephemeral_torrents.insert(id);
+    }
+    set_err(""); return id;
+}
+
 TORRENT_API lt_torrent_id lt_add_torrent_file(lt_session_t session,
                                               const char* fp, const char* path,
-                                              int stream_only) {
+                                              int add_flags) {
     if (!session || !fp || !path) { set_err("null arg"); return -1; }
     auto* sw = to_sw(session);
     try {
         lt::error_code ec;
-        auto ti = std::make_shared<lt::torrent_info>(fp, ec);
+        auto atp = lt::load_torrent_file(fp, ec, {});
         if (ec) { set_err(ec.message()); return -1; }
-        lt::add_torrent_params atp;
-        atp.ti = ti; atp.save_path = path;
-        atp.flags &= ~lt::torrent_flags::paused;
-        atp.flags &= ~lt::torrent_flags::auto_managed;
+        return add_params(sw, std::move(atp), path, add_flags);
+    } catch (const std::exception& e) { set_err(e.what()); return -1; }
+}
 
-        if (stream_only) {
-            atp.storage_mode = lt::storage_mode_sparse;
-            atp.flags |= lt::torrent_flags::stop_when_ready;
-        }
-
-        lt::torrent_handle h = sw->session.add_torrent(std::move(atp), ec);
+// Restores a torrent from lt_save_resume data: its verified pieces are taken
+// as they are, so only file sizes are checked instead of hashing every piece.
+TORRENT_API lt_torrent_id lt_add_resume(lt_session_t session,
+                                        const char* resume_path,
+                                        const char* path, int add_flags) {
+    if (!session || !resume_path || !path) { set_err("null arg"); return -1; }
+    auto* sw = to_sw(session);
+    try {
+        std::ifstream file(std::filesystem::u8path(resume_path), std::ios::binary);
+        const std::vector<char> bytes{std::istreambuf_iterator<char>(file),
+                                      std::istreambuf_iterator<char>()};
+        if (file.bad()) { set_err("cannot read resume data"); return -1; }
+        lt::error_code ec;
+        auto atp = lt::read_resume_data(bytes, ec);
         if (ec) { set_err(ec.message()); return -1; }
-        h.resume();
-
-        int64_t id = sw->next_id.fetch_add(1);
-        {
-            std::lock_guard<std::mutex> lk(sw->mu);
-            sw->handles[id] = h;
-            if (stream_only) sw->ephemeral_torrents.insert(id);
-        }
-        set_err(""); return id;
+        return add_params(sw, std::move(atp), path, add_flags);
     } catch (const std::exception& e) { set_err(e.what()); return -1; }
 }
 
@@ -2302,6 +2325,52 @@ TORRENT_API void lt_recheck_torrent(lt_session_t session, lt_torrent_id id) {
         try { it->second.force_recheck(); } catch (...) {}
 }
 
+// Persist magnet metadata so paused/completed tasks can recover offline.
+TORRENT_API int lt_save_metadata(lt_session_t session, lt_torrent_id id,
+                                  const char* path) {
+    if (!session || !path) return 0;
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lk(sw->mu);
+    try {
+        auto it = sw->handles.find(id);
+        if (it == sw->handles.end()) return 0;
+        auto ti = it->second.torrent_file();
+        if (!ti) return 0;
+        const auto atp = it->second.get_resume_data(lt::torrent_handle::save_info_dict);
+        const auto bytes = lt::write_torrent_file_buf(atp,
+            lt::write_flags::allow_missing_piece_layer | lt::write_flags::include_dht_nodes);
+        std::ofstream file(std::filesystem::u8path(path), std::ios::binary);
+        file.write(bytes.data(), bytes.size());
+        file.close();
+        return file ? 1 : 0;
+    } catch (...) { return 0; }
+}
+
+// Persist fast-resume data (verified pieces and the info dictionary) for
+// lt_add_resume. Written beside the target first, so a crash never leaves a
+// truncated file.
+TORRENT_API int lt_save_resume(lt_session_t session, lt_torrent_id id,
+                               const char* path) {
+    if (!session || !path) return 0;
+    auto* sw = to_sw(session);
+    std::lock_guard<std::mutex> lk(sw->mu);
+    try {
+        auto it = sw->handles.find(id);
+        if (it == sw->handles.end() || !it->second.torrent_file()) return 0;
+        const auto bytes = lt::write_resume_data_buf(
+            it->second.get_resume_data(lt::torrent_handle::save_info_dict));
+        const auto target = std::filesystem::u8path(path);
+        auto pending = target;
+        pending += ".pending";
+        std::ofstream file(pending, std::ios::binary | std::ios::trunc);
+        file.write(bytes.data(), bytes.size());
+        file.close();
+        if (!file) return 0;
+        std::filesystem::rename(pending, target);
+        return 1;
+    } catch (...) { return 0; }
+}
+
 // ── status queries ──────────────────────────────────────────────────────────────
 
 TORRENT_API int lt_get_torrent_count(lt_session_t session) {
@@ -2321,8 +2390,9 @@ TORRENT_API int lt_get_all_statuses(lt_session_t session,
         if (n >= max) break;
         if (!kv.second.is_valid()) continue;
         try {
-            lt::torrent_status st = kv.second.status(lt::torrent_handle::query_pieces);
+            lt::torrent_status st = kv.second.status({});
             fill_status(out[n], kv.first, st);
+            out[n].dht_nodes = sw->bt_config.disable_dht ? -1 : sw->dht_nodes.load();
             n++;
         } catch (...) {}
     }
@@ -2336,8 +2406,11 @@ TORRENT_API int lt_get_status(lt_session_t session, lt_torrent_id id,
     std::lock_guard<std::mutex> lk(sw->mu);
     auto it = sw->handles.find(id);
     if (it == sw->handles.end() || !it->second.is_valid()) return 0;
-    try { fill_status(*out, id,
-          it->second.status(lt::torrent_handle::query_pieces)); return 1; } catch (...) { return 0; }
+    try {
+        fill_status(*out, id, it->second.status({}));
+        out->dht_nodes = sw->bt_config.disable_dht ? -1 : sw->dht_nodes.load();
+        return 1;
+    } catch (...) { return 0; }
 }
 
 // ── file queries ────────────────────────────────────────────────────────────────
@@ -2367,14 +2440,19 @@ TORRENT_API int lt_get_files(lt_session_t session, lt_torrent_id id,
 #endif
             return 0;
         }
-        const lt::file_storage& fs = ti->files();
+        const lt::file_storage& fs = ti->layout();
+        const auto renames = it->second.get_renamed_files();
+        std::vector<std::int64_t> progress;
+        it->second.file_progress(progress, lt::torrent_handle::piece_granularity);
         int n = 0;
         for (int i = 0; i < fs.num_files() && n < max; ++i, ++n) {
             lt::file_index_t fi{i};
             out[n].index = i;
-            std::string nm = std::string(fs.file_name(fi));
+            out[n].size = fs.file_size(fi);
+            out[n].downloaded_bytes = i < static_cast<int>(progress.size()) ? progress[i] : 0;
+            std::string nm = std::string(renames.file_name(fs, fi));
             out[n].is_streamable = is_streamable(nm) ? 1 : 0;
-            std::string pt = fs.file_path(fi);
+            std::string pt = renames.file_path(fs, fi);
             std::strncpy(out[n].name, nm.c_str(), sizeof(out[n].name) - 1);
             std::strncpy(out[n].path, pt.c_str(), sizeof(out[n].path) - 1);
             out[n].name[sizeof(out[n].name) - 1] = 0;
@@ -2384,7 +2462,7 @@ TORRENT_API int lt_get_files(lt_session_t session, lt_torrent_id id,
         __android_log_print(ANDROID_LOG_INFO, "libtorrent_flutter", "lt_get_files: successfully processed %d files", n);
 #endif
         return n;
-    } catch (const std::exception& e) {
+    } catch ([[maybe_unused]] const std::exception& e) {
 #ifdef __ANDROID__
         __android_log_print(ANDROID_LOG_ERROR, "libtorrent_flutter", "lt_get_files exception: %s", e.what());
 #endif
@@ -2407,7 +2485,7 @@ TORRENT_API void lt_set_file_priorities(lt_session_t session, lt_torrent_id id,
     try {
         auto ti = it->second.torrent_file();
         if (!ti) return;
-        int nf = ti->files().num_files();
+        int nf = ti->num_files();
         std::vector<lt::download_priority_t> p;
         p.reserve(nf);
         for (int i = 0; i < nf; ++i)
@@ -2438,14 +2516,15 @@ TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
 
     auto ti = handle.torrent_file();
     if (!ti) { set_err("no metadata yet"); return -1; }
-    const lt::file_storage& fs = ti->files();
+    const lt::file_storage& fs = ti->layout();
+    const auto renames = handle.get_renamed_files();
 
     // auto-select largest streamable file
     if (file_index < 0) {
         int64_t best = -1; file_index = 0;
         for (int i = 0; i < fs.num_files(); ++i) {
             int64_t sz = fs.file_size(lt::file_index_t{i});
-            if (sz > best && is_streamable(std::string(fs.file_name(lt::file_index_t{i})))) {
+            if (sz > best && is_streamable(std::string(renames.file_name(fs, lt::file_index_t{i})))) {
                 best = sz; file_index = i;
             }
         }
@@ -2458,6 +2537,10 @@ TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
     s->id           = sw->next_stream_id.fetch_add(1);
     s->torrent_id   = torrent_id;
     s->file_index   = file_index;
+    {
+        std::lock_guard<std::mutex> lk(sw->mu);
+        s->background_download = !sw->ephemeral_torrents.count(torrent_id);
+    }
     s->handle       = handle;
     s->ti           = ti;
     s->piece_length = ti->piece_length();
@@ -2468,15 +2551,13 @@ TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
                      (int)((s->file_offset + s->file_size - 1) / s->piece_length));
     s->total_pieces = s->end_piece - s->start_piece + 1;
 
-    // head/tail protection boundaries
-    int prot_pieces = (int)((StreamEngine::PROTECT_BYTES + s->piece_length - 1) / s->piece_length);
-    s->head_end_piece  = std::min(s->start_piece + prot_pieces - 1, s->end_piece);
-    s->tail_start_piece = std::max(s->end_piece - prot_pieces + 1, s->start_piece);
+    s->window_pieces = std::clamp(
+        (int)(StreamEngine::WINDOW_BYTES / s->piece_length), 2, 48);
+    s->critical_pieces = std::clamp(
+        (int)(StreamEngine::CRITICAL_BYTES / s->piece_length), 1,
+        s->window_pieces);
 
-    // ── Adaptive bitrate estimation ──
-    // Estimate media bitrate from file size assuming typical video duration.
-    // This is crude but vastly better than a fixed 5 Mbps for ALL files.
-    // A 1.2GB file ≈ 1.5h movie ≈ ~1.5 MB/s; a 4GB file ≈ 2h movie ≈ ~3.3 MB/s
+    // Media bitrate guessed from file size, for buffer_seconds only.
     {
         float duration_guess;
         if      (s->file_size < 400LL * 1024 * 1024)            duration_guess = 3600.0f;  // <400MB → 1h (episode)
@@ -2485,17 +2566,6 @@ TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
         else if (s->file_size < 8LL * 1024 * 1024 * 1024)       duration_guess = 7200.0f;  // <8GB → 2h
         else                                                     duration_guess = 9000.0f;  // 8GB+ → 2.5h
         s->estimated_bitrate_bps = (float)s->file_size / duration_guess;
-
-        // Critical startup: target ~2 seconds of video, but at least 1 piece
-        // and at most 5 pieces. For a 4GB file with 4MB pieces and ~3.3MB/s
-        // bitrate, this gives max(1, 6.6/4) = 1-2 pieces instead of 5.
-        int startup_bytes = (int)(s->estimated_bitrate_bps * 2.0f);
-        startup_bytes = std::max(startup_bytes, s->piece_length);
-        s->critical_startup_pieces = std::clamp(startup_bytes / s->piece_length, 1, 5);
-
-        TB_LOG("ADAPTIVE: file_size=%lldMB piece=%dKB bitrate_est=%.0fKB/s critical_pieces=%d",
-               (long long)(s->file_size / (1024*1024)), s->piece_length / 1024,
-               s->estimated_bitrate_bps / 1024.0f, s->critical_startup_pieces);
     }
 
     // ── TorrCache initialization — port of torrstor.NewCache + Cache.Init ──
@@ -2531,37 +2601,27 @@ TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
         handle.unset_flags(lt::torrent_flags::stop_when_ready);
 
         // Set piece priorities BEFORE resume().
-        // All pieces start as dont_download, then we enable only what we need.
+        // Persistent downloads keep fetching the complete torrent while readers
+        // prioritize their current range. Ephemeral streams fetch on demand.
         std::vector<lt::download_priority_t> prios(
-            (size_t)ti->num_pieces(), lt::dont_download);
+            (size_t)ti->num_pieces(), s->background_priority());
 
-        // Critical startup pieces — adaptive count based on bitrate estimate.
-        // These get top_priority + tight deadlines to minimize time-to-first-frame.
-        int crit = s->critical_startup_pieces;
-        for (int p = s->start_piece; p <= std::min(s->start_piece + crit - 1, s->end_piece); ++p)
+        // Container headers come first, then the last piece that holds an
+        // MP4 index or MKV cues. The reader's window follows its position;
+        // a resumed episode seeks away from the head right after probing.
+        const int head_last = std::min(
+            s->start_piece + s->critical_pieces - 1, s->end_piece);
+        for (int p = s->start_piece; p <= head_last; ++p)
             prios[p] = lt::top_priority;
-
-        // Remaining head pieces at lower priority — they'll download after
-        // critical pieces without competing for bandwidth
-        for (int p = s->start_piece + crit; p <= s->head_end_piece; ++p)
-            prios[p] = lt::download_priority_t(4);
-
-        // Tail pieces for moov atom — priority 5 (below head critical,
-        // above remaining head). For large files this prevents tail from
-        // stealing bandwidth that the first frame needs.
-        for (int p = s->tail_start_piece; p <= s->end_piece; ++p)
-            prios[p] = lt::download_priority_t(5);
+        prios[s->end_piece] = lt::top_priority;
 
         handle.prioritize_pieces(prios);
 
-        // Deadlines: critical pieces get tight deadlines (0-100ms),
-        // tail gets pushed back (1000ms) so time-critical picker
-        // strongly favors head over tail.
-        for (int i = 0; i < crit && s->start_piece + i <= s->end_piece; ++i)
+        for (int p = s->start_piece; p <= head_last; ++p)
             handle.set_piece_deadline(
-                lt::piece_index_t(s->start_piece + i), i * 50);
-        for (int p = s->tail_start_piece; p <= s->end_piece; ++p)
-            handle.set_piece_deadline(lt::piece_index_t(p), 1000);
+                lt::piece_index_t(p), (p - s->start_piece) * 100);
+        if (s->end_piece > head_last)
+            handle.set_piece_deadline(lt::piece_index_t(s->end_piece), 300);
 
         // NOW resume — priorities are already set, no random downloads
         handle.resume();
@@ -2587,7 +2647,7 @@ TORRENT_API lt_stream_id lt_start_stream(lt_session_t session,
                 // only pre-load first 2 + tail pieces into read_results
                 // (kept minimal to limit RAM — serve_range reads the rest on demand)
                 bool is_head = (p <= s->start_piece + 1);
-                bool is_tail = (p >= s->tail_start_piece);
+                bool is_tail = (p == s->end_piece);
                 if (is_head || is_tail) {
                     try { handle.read_piece(lt::piece_index_t(p)); } catch (...) {}
                 }
@@ -2674,7 +2734,7 @@ TORRENT_API void lt_stop_stream(lt_session_t session, lt_stream_id sid) {
         try {
             auto ti2 = stream->handle.torrent_file();
             if (ti2) {
-                int nf = ti2->files().num_files();
+                int nf = ti2->num_files();
                 std::vector<lt::download_priority_t> p((size_t)nf, lt::default_priority);
                 stream->handle.prioritize_files(p);
             }
@@ -2858,23 +2918,13 @@ TORRENT_API void lt_configure_session(lt_session_t session,
     // apply to libtorrent session — port of btserver.go configure()
     lt::settings_pack sp;
 
-    // port of: bt.config.DisableIPv6 = !settings.BTsets.EnableIPv6
-    if (!cfg.enable_ipv6) {
-        sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881");
-    }
-
-    // port of: bt.config.DisableTCP / DisableUTP
-    // libtorrent doesn't have direct disable flags — use listen_interfaces
-    // If both disabled, that's invalid, so skip
-    if (cfg.disable_tcp && !cfg.disable_utp) {
-        // UTP only — listen on UDP only (libtorrent uses same interfaces for both)
-        // libtorrent doesn't directly support TCP-only disable, we approximate
-        // by removing TCP from outgoing
-    }
-    if (cfg.disable_utp && !cfg.disable_tcp) {
-        sp.set_bool(lt::settings_pack::enable_outgoing_utp, false);
-        sp.set_bool(lt::settings_pack::enable_incoming_utp, false);
-    }
+    const auto port = std::to_string(cfg.peers_listen_port);
+    sp.set_str(lt::settings_pack::listen_interfaces,
+        "0.0.0.0:" + port + (cfg.enable_ipv6 ? ",[::]:" + port : ""));
+    sp.set_bool(lt::settings_pack::enable_outgoing_tcp, !cfg.disable_tcp);
+    sp.set_bool(lt::settings_pack::enable_incoming_tcp, !cfg.disable_tcp);
+    sp.set_bool(lt::settings_pack::enable_outgoing_utp, !cfg.disable_utp);
+    sp.set_bool(lt::settings_pack::enable_incoming_utp, !cfg.disable_utp);
 
     // port of: bt.config.NoDefaultPortForwarding = settings.BTsets.DisableUPNP
     sp.set_bool(lt::settings_pack::enable_upnp,  !cfg.disable_upnp);
@@ -2890,8 +2940,13 @@ TORRENT_API void lt_configure_session(lt_session_t session,
         sp.set_int(lt::settings_pack::active_seeds, 0);
     }
 
-    // port of: bt.config.EstablishedConnsPerTorrent = settings.BTsets.ConnectionsLimit
-    sp.set_int(lt::settings_pack::connections_limit, cfg.connections_limit * 20);
+    if (!cfg.disable_upload) {
+        sp.set_int(lt::settings_pack::unchoke_slots_limit, 8);
+    }
+
+    // Per-torrent limits and application queue admission bound connections.
+    // A second fixed session cap would starve admitted downloads and seeders.
+    sp.set_int(lt::settings_pack::connections_limit, std::numeric_limits<int>::max());
 
     // port of: bt.config.TotalHalfOpenConns = 500
     // (already hardcoded in lt_create_session, re-apply for safety)
@@ -2917,14 +2972,16 @@ TORRENT_API void lt_configure_session(lt_session_t session,
         sp.set_int(lt::settings_pack::upload_rate_limit, 0);
     }
 
-    // port of: userAgent spoofing — TorrServer pretends to be qBittorrent 4.3.9
-    sp.set_str(lt::settings_pack::user_agent, "qBittorrent/4.3.9");
-    sp.set_str(lt::settings_pack::peer_fingerprint, "-qB4390-");
-    sp.set_str(lt::settings_pack::handshake_client_version, "qBittorrent/4.3.9");
 
     try {
         sw->session.apply_settings(sp);
     } catch (...) {}
+
+    {
+        std::lock_guard<std::mutex> lk(sw->mu);
+        for (auto& kv : sw->handles)
+            kv.second.set_max_connections(cfg.connections_limit);
+    }
 
     // Re-apply stream-local settings to active streams as well. Without
     // this, configureSession() only affects streams created AFTER the call,

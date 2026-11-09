@@ -48,6 +48,16 @@ final class LtTorrentStatus extends Struct {
   external int hasMetadata;
   @Int32()
   external int queuePosition;
+  @Int32()
+  external int knownPeers;
+  @Int32()
+  external int trackerCount;
+  @Int32()
+  external int workingTrackers;
+  @Int32()
+  external int failedTrackers;
+  @Int32()
+  external int dhtNodes;
 }
 
 // ─── lt_file_info ─────────────────────────────────────────────────────────────
@@ -62,6 +72,8 @@ final class LtFileInfo extends Struct {
   external int size;
   @Int32()
   external int isStreamable;
+  @Int64()
+  external int downloadedBytes;
 }
 
 // ─── lt_stream_status ─────────────────────────────────────────────────────────
@@ -315,14 +327,18 @@ String readCharArray(Array<Char> arr, int maxLen) {
 }
 
 // ─── Cross-platform library resolution ──────────────────────────────────────
+/// Where the build hook's bundled library was loaded from (macOS, Linux).
+@Native<Pointer<Utf8> Function()>(symbol: 'lt_library_path')
+external Pointer<Utf8> _bundledLibraryPath();
+
 DynamicLibrary _openNativeLib() {
   const libName = 'libtorrent_flutter';
   if (Platform.isWindows) {
     return DynamicLibrary.open('$libName.dll');
-  } else if (Platform.isAndroid || Platform.isLinux) {
+  } else if (Platform.isAndroid) {
     return DynamicLibrary.open('lib$libName.so');
-  } else if (Platform.isMacOS) {
-    return DynamicLibrary.open('lib$libName.dylib');
+  } else if (Platform.isMacOS || Platform.isLinux) {
+    return DynamicLibrary.open(_bundledLibraryPath().toDartString());
   } else if (Platform.isIOS) {
     return DynamicLibrary.process();
   }
@@ -335,10 +351,18 @@ class TorrentBridgeBindings {
 
   late final LtCreateSession createSession;
   late final LtDestroySession destroySession;
+  late final NativeFinalizer sessionFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFinalizerFunction>('lt_destroy_session'),
+  );
   late final LtPollAlerts pollAlerts;
   late final LtSetAlertCallback setAlertCallback;
+  late final int Function(Pointer<LtSessionOpaque>, int, Pointer<Utf8>)
+      saveMetadata;
+  late final int Function(Pointer<LtSessionOpaque>, int, Pointer<Utf8>)
+      saveResume;
   late final LtAddMagnet addMagnet;
   late final LtAddTorrentFile addTorrentFile;
+  late final LtAddTorrentFile addResume;
   late final LtRemoveTorrent removeTorrent;
   late final LtPauseTorrent pauseTorrent;
   late final LtResumeTorrent resumeTorrent;
@@ -377,11 +401,22 @@ class TorrentBridgeBindings {
     setAlertCallback = _lib
         .lookup<NativeFunction<_SetAlertCallbackN>>('lt_set_alert_callback')
         .asFunction<LtSetAlertCallback>();
+    saveMetadata = _lib.lookupFunction<
+        Int32 Function(Pointer<LtSessionOpaque>, Int64, Pointer<Utf8>),
+        int Function(
+            Pointer<LtSessionOpaque>, int, Pointer<Utf8>)>('lt_save_metadata');
+    saveResume = _lib.lookupFunction<
+        Int32 Function(Pointer<LtSessionOpaque>, Int64, Pointer<Utf8>),
+        int Function(
+            Pointer<LtSessionOpaque>, int, Pointer<Utf8>)>('lt_save_resume');
     addMagnet = _lib
         .lookup<NativeFunction<_AddMagnetN>>('lt_add_magnet')
         .asFunction<LtAddMagnet>();
     addTorrentFile = _lib
         .lookup<NativeFunction<_AddTorrentFileN>>('lt_add_torrent_file')
+        .asFunction<LtAddTorrentFile>();
+    addResume = _lib
+        .lookup<NativeFunction<_AddTorrentFileN>>('lt_add_resume')
         .asFunction<LtAddTorrentFile>();
     removeTorrent = _lib
         .lookup<NativeFunction<_RemoveTorrentN>>('lt_remove_torrent')

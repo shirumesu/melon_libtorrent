@@ -58,6 +58,11 @@ typedef struct {
     int32_t       is_finished;
     int32_t       has_metadata;
     int32_t       queue_position;
+    int32_t       known_peers;
+    int32_t       tracker_count;
+    int32_t       working_trackers;
+    int32_t       failed_trackers;
+    int32_t       dht_nodes;
 } lt_torrent_status;
 
 typedef struct {
@@ -66,6 +71,7 @@ typedef struct {
     char    path[1024];
     int64_t size;
     int32_t is_streamable;
+    int64_t downloaded_bytes;
 } lt_file_info;
 
 typedef struct {
@@ -111,6 +117,12 @@ typedef struct {
 typedef void (*lt_alert_callback)(int alert_type, lt_torrent_id id,
                                   const char* message, void* user_data);
 
+/* Export complete metadata for offline recovery. */
+TORRENT_API int lt_save_metadata(lt_session_t session, lt_torrent_id id, const char* path);
+/* Export fast-resume data; lt_add_resume restores the torrent from it without
+   hashing its files again. */
+TORRENT_API int lt_save_resume(lt_session_t session, lt_torrent_id id, const char* path);
+
 /* session */
 /* Android/OpenSSL trust-store setup. Call before lt_create_session(). */
 TORRENT_API void lt_set_ssl_cert_path(const char* path);
@@ -131,14 +143,19 @@ TORRENT_API void lt_poll_alerts(lt_session_t session,
                                 lt_alert_callback cb, void* user_data);
 
 /* torrent management */
+/* Add flags: 1=stream-only, 2=start paused, 4=stop after local verification. */
 TORRENT_API lt_torrent_id lt_add_magnet(lt_session_t session,
                                         const char* magnet_uri,
                                         const char* save_path,
-                                        int stream_only);
+                                        int add_flags);
 TORRENT_API lt_torrent_id lt_add_torrent_file(lt_session_t session,
                                               const char* file_path,
                                               const char* save_path,
-                                              int stream_only);
+                                              int add_flags);
+TORRENT_API lt_torrent_id lt_add_resume(lt_session_t session,
+                                        const char* resume_path,
+                                        const char* save_path,
+                                        int add_flags);
 TORRENT_API void lt_remove_torrent(lt_session_t session,
                                    lt_torrent_id id, int delete_files);
 TORRENT_API void lt_pause_torrent(lt_session_t session, lt_torrent_id id);

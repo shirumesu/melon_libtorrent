@@ -78,6 +78,11 @@ TorrentInfo _toTorrentInfo(LtTorrentStatus s) => TorrentInfo(
   isFinished: s.isFinished != 0,
   hasMetadata: s.hasMetadata != 0,
   queuePosition: s.queuePosition,
+  knownPeers: s.knownPeers,
+  trackerCount: s.trackerCount,
+  workingTrackers: s.workingTrackers,
+  failedTrackers: s.failedTrackers,
+  dhtNodes: s.dhtNodes,
 );
 
 FileInfo _toFileInfo(LtFileInfo f) => FileInfo(
@@ -86,6 +91,7 @@ FileInfo _toFileInfo(LtFileInfo f) => FileInfo(
   path: readCharArray(f.path, 1024),
   size: f.size,
   isStreamable: f.isStreamable != 0,
+  downloadedBytes: f.downloadedBytes,
 );
 
 StreamInfo _toStreamInfo(LtStreamStatus s) => StreamInfo(
@@ -114,7 +120,7 @@ StreamInfo _toStreamInfo(LtStreamStatus s) => StreamInfo(
 /// final stream = LibtorrentFlutter.instance.startStream(torrentId);
 /// // Pass stream.url to your video player
 /// ```
-class LibtorrentFlutter {
+class LibtorrentFlutter implements Finalizable {
   static LibtorrentFlutter? _instance;
 
   late final TorrentBridgeBindings _b;
@@ -235,6 +241,7 @@ class LibtorrentFlutter {
         throw StateError('Failed to create libtorrent session: $err');
       }
       engine._session = session;
+      engine._b.sessionFinalizer.attach(engine, session.cast(), detach: engine);
     } finally {
       malloc.free(iface);
     }
@@ -267,12 +274,24 @@ class LibtorrentFlutter {
   ///
   /// Returns the torrent ID. [savePath] defaults to the path set in init().
   /// Set [streamOnly] to true to prevent background downloading.
-  int addMagnet(String magnetUri, [String? savePath, bool streamOnly = false]) {
+  /// [startPaused] prevents peer connections before queue admission.
+  /// [stopWhenReady] checks local files and stops before transferring data.
+  int addMagnet(String magnetUri,
+      [String? savePath,
+      bool streamOnly = false,
+      bool startPaused = false,
+      bool stopWhenReady = false]) {
     final enhanced = TrackerManager.injectTrackers(magnetUri);
     final m = enhanced.toNativeUtf8();
     final s = (savePath ?? _defaultSavePath).toNativeUtf8();
     try {
-      final id = _b.addMagnet(_session, m, s, streamOnly ? 1 : 0);
+      final id = _b.addMagnet(
+          _session,
+          m,
+          s,
+          (streamOnly ? 1 : 0) |
+              (startPaused ? 2 : 0) |
+              (stopWhenReady ? 4 : 0));
       if (id < 0) throw Exception(_b.lastError().toDartString());
       return id;
     } finally {
@@ -286,15 +305,44 @@ class LibtorrentFlutter {
     String filePath, [
     String? savePath,
     bool streamOnly = false,
+    bool startPaused = false,
+    bool stopWhenReady = false,
   ]) {
     final f = filePath.toNativeUtf8();
     final s = (savePath ?? _defaultSavePath).toNativeUtf8();
     try {
-      final id = _b.addTorrentFile(_session, f, s, streamOnly ? 1 : 0);
+      final id = _b.addTorrentFile(
+          _session,
+          f,
+          s,
+          (streamOnly ? 1 : 0) |
+              (startPaused ? 2 : 0) |
+              (stopWhenReady ? 4 : 0));
       if (id < 0) throw Exception(_b.lastError().toDartString());
       return id;
     } finally {
       malloc.free(f);
+      malloc.free(s);
+    }
+  }
+
+  /// Add a torrent from fast-resume data written by [saveResume]: its
+  /// verified pieces are trusted, so only file sizes are checked.
+  int addResume(
+    String resumePath, [
+    String? savePath,
+    bool startPaused = false,
+    bool stopWhenReady = false,
+  ]) {
+    final r = resumePath.toNativeUtf8();
+    final s = (savePath ?? _defaultSavePath).toNativeUtf8();
+    try {
+      final id = _b.addResume(
+          _session, r, s, (startPaused ? 2 : 0) | (stopWhenReady ? 4 : 0));
+      if (id < 0) throw Exception(_b.lastError().toDartString());
+      return id;
+    } finally {
+      malloc.free(r);
       malloc.free(s);
     }
   }
@@ -311,6 +359,27 @@ class LibtorrentFlutter {
 
   /// Resume a paused torrent.
   void resumeTorrent(int id) => _b.resumeTorrent(_session, id);
+
+  /// Save complete torrent metadata for offline restoration.
+  bool saveMetadata(int id, String path) {
+    final nativePath = path.toNativeUtf8();
+    try {
+      return _b.saveMetadata(_session, id, nativePath) == 1;
+    } finally {
+      malloc.free(nativePath);
+    }
+  }
+
+  /// Write fast-resume data for [addResume]; false while the torrent has no
+  /// metadata or the file cannot be written.
+  bool saveResume(int id, String path) {
+    final nativePath = path.toNativeUtf8();
+    try {
+      return _b.saveResume(_session, id, nativePath) == 1;
+    } finally {
+      malloc.free(nativePath);
+    }
+  }
 
   /// Recheck torrent integrity.
   void recheckTorrent(int id) => _b.recheckTorrent(_session, id);
@@ -534,10 +603,7 @@ class LibtorrentFlutter {
     Pointer<Utf8> message,
     Pointer<Void> userData,
   ) {
-    // Silently consume alerts — users can listen to torrentUpdates for state changes.
-    // Uncomment for debugging:
-    final msg = message.toDartString();
-    print('LibtorrentFlutter Alert: [T$torrentId] $msg');
+    // Drain native alerts; torrentUpdates exposes application state changes.
   }
 
   void _pollTorrents() {
@@ -545,24 +611,16 @@ class LibtorrentFlutter {
     final buf = calloc<LtTorrentStatus>(max(count, _maxTorrents));
     try {
       final n = _b.getAllStatuses(_session, buf, max(count, _maxTorrents));
-      bool changed = false;
-      final seen = <int>{};
-
+      final snapshot = <int, TorrentInfo>{};
       for (var i = 0; i < n; i++) {
         final info = _toTorrentInfo(buf[i]);
-        seen.add(info.id);
-        final old = _torrents[info.id];
-        if (old == null || _changed(old, info)) {
-          _torrents[info.id] = info;
-          changed = true;
-        }
+        snapshot[info.id] = info;
       }
-      final stale = _torrents.keys.where((k) => !seen.contains(k)).toList();
-      for (final k in stale) {
-        _torrents.remove(k);
-        changed = true;
-      }
-      if (changed) _torrentsCtrl.add(Map.unmodifiable(_torrents));
+      _torrents
+        ..clear()
+        ..addAll(snapshot);
+      // Consumers account for active seeding time even when peers are idle.
+      _torrentsCtrl.add(Map.unmodifiable(_torrents));
     } finally {
       calloc.free(buf);
     }
@@ -595,17 +653,6 @@ class LibtorrentFlutter {
       calloc.free(buf);
     }
   }
-
-  bool _changed(TorrentInfo a, TorrentInfo b) =>
-      a.state != b.state ||
-      a.progress != b.progress ||
-      a.downloadRate != b.downloadRate ||
-      a.uploadRate != b.uploadRate ||
-      a.totalDone != b.totalDone ||
-      a.numPeers != b.numPeers ||
-      a.isPaused != b.isPaused ||
-      a.hasMetadata != b.hasMetadata ||
-      a.name != b.name;
 
   // ─── Cleanup ───────────────────────────────────────────────────────────────
 
@@ -642,12 +689,11 @@ class LibtorrentFlutter {
     }
   }
 
-  /// Shut down the engine entirely. Calls [disposeAll] first, then
-  /// destroys the native session. After this, you'd need to call
+  /// Shut down the engine and destroy the native session without deleting data. After this, you'd need to call
   /// [init] again to use the engine.
   Future<void> dispose() async {
-    disposeAll();
     _pollTimer?.cancel();
+    _b.sessionFinalizer.detach(this);
     _b.destroySession(_session);
     await _torrentsCtrl.close();
     await _streamsCtrl.close();
