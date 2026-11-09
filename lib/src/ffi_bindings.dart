@@ -1,4 +1,7 @@
 // FFI bindings mirroring torrent_bridge.h — cross-platform library loader.
+// Not exported: the struct layouts and signatures are documented in the
+// header, and must change together with it.
+// ignore_for_file: public_member_api_docs
 
 import 'dart:ffi';
 import 'dart:convert';
@@ -255,7 +258,13 @@ typedef _StartStreamN =
       Pointer<LtStreamConfig>,
     );
 typedef LtStartStream =
-    int Function(Pointer<LtSessionOpaque>, int, int, int, Pointer<LtStreamConfig>);
+    int Function(
+      Pointer<LtSessionOpaque>,
+      int,
+      int,
+      int,
+      Pointer<LtStreamConfig>,
+    );
 
 typedef _StopStreamN = Void Function(Pointer<LtSessionOpaque>, Int64);
 typedef LtStopStream = void Function(Pointer<LtSessionOpaque>, int);
@@ -389,9 +398,9 @@ class TorrentBridgeBindings {
   late final LtPollAlerts pollAlerts;
   late final LtSetAlertCallback setAlertCallback;
   late final int Function(Pointer<LtSessionOpaque>, int, Pointer<Utf8>)
-      saveMetadata;
+  saveMetadata;
   late final int Function(Pointer<LtSessionOpaque>, int, Pointer<Utf8>)
-      saveResume;
+  saveResume;
   late final LtAddMagnet addMagnet;
   late final LtAddTorrentFile addTorrentFile;
   late final LtAddTorrentFile addResume;
@@ -432,14 +441,16 @@ class TorrentBridgeBindings {
     setAlertCallback = _lib
         .lookup<NativeFunction<_SetAlertCallbackN>>('lt_set_alert_callback')
         .asFunction<LtSetAlertCallback>();
-    saveMetadata = _lib.lookupFunction<
-        Int32 Function(Pointer<LtSessionOpaque>, Int64, Pointer<Utf8>),
-        int Function(
-            Pointer<LtSessionOpaque>, int, Pointer<Utf8>)>('lt_save_metadata');
-    saveResume = _lib.lookupFunction<
-        Int32 Function(Pointer<LtSessionOpaque>, Int64, Pointer<Utf8>),
-        int Function(
-            Pointer<LtSessionOpaque>, int, Pointer<Utf8>)>('lt_save_resume');
+    saveMetadata = _lib
+        .lookupFunction<
+          Int32 Function(Pointer<LtSessionOpaque>, Int64, Pointer<Utf8>),
+          int Function(Pointer<LtSessionOpaque>, int, Pointer<Utf8>)
+        >('lt_save_metadata');
+    saveResume = _lib
+        .lookupFunction<
+          Int32 Function(Pointer<LtSessionOpaque>, Int64, Pointer<Utf8>),
+          int Function(Pointer<LtSessionOpaque>, int, Pointer<Utf8>)
+        >('lt_save_resume');
     addMagnet = _lib
         .lookup<NativeFunction<_AddMagnetN>>('lt_add_magnet')
         .asFunction<LtAddMagnet>();

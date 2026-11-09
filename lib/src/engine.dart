@@ -113,15 +113,25 @@ StreamInfo _toStreamInfo(LtStreamStatus s) => StreamInfo(
 
 // ─── LibtorrentFlutter ──────────────────────────────────────────────────────
 
-/// The main libtorrent engine for Flutter.
+/// The libtorrent session of this isolate.
 ///
-/// Usage:
 /// ```dart
-/// await LibtorrentFlutter.init();
-/// final torrentId = LibtorrentFlutter.instance.addMagnet(magnetUri, savePath);
-/// final stream = LibtorrentFlutter.instance.startStream(torrentId);
-/// // Pass stream.url to your video player
+/// await LibtorrentFlutter.init(userAgent: 'MyApp/1.0');
+/// final engine = LibtorrentFlutter.instance;
+/// final id = engine.addMagnet(magnetUri, savePath);
+/// engine.torrentUpdates.listen((torrents) => print(torrents[id]));
+/// // Once torrents[id].hasMetadata:
+/// final stream = engine.startStream(id);
+/// // Pass stream.url to a video player.
 /// ```
+///
+/// Torrents are not auto-managed: libtorrent does not queue them, so every
+/// torrent transfers until [pauseTorrent] pauses it; queueing and seeding
+/// policy belong to the application. Status is polled every
+/// `pollInterval` and emitted on [torrentUpdates] even when nothing
+/// changed. If the isolate shuts down without [dispose] (for example on
+/// hot restart), a finalizer still destroys the native session; downloaded
+/// files are kept either way.
 class LibtorrentFlutter implements Finalizable {
   static LibtorrentFlutter? _instance;
 
@@ -150,9 +160,8 @@ class LibtorrentFlutter implements Finalizable {
 
   /// The singleton instance. Only available after [init] completes.
   static LibtorrentFlutter get instance {
-    if (_instance == null)
-      throw StateError('LibtorrentFlutter.init() not called');
-    return _instance!;
+    return _instance ??
+        (throw StateError('LibtorrentFlutter.init() not called'));
   }
 
   /// Whether the engine has been initialized.
@@ -277,25 +286,34 @@ class LibtorrentFlutter implements Finalizable {
   /// Add a torrent from a magnet URI.
   ///
   /// Returns the torrent ID. [savePath] defaults to the path set in init().
-  /// Set [streamOnly] to true to prevent background downloading.
-  /// [startPaused] prevents peer connections before queue admission.
-  /// [stopWhenReady] checks local files and stops before transferring data.
-  int addMagnet(String magnetUri,
-      [String? savePath,
-      bool streamOnly = false,
-      bool startPaused = false,
-      bool stopWhenReady = false]) {
+  /// A magnet without trackers gets init's `fallbackTrackers`.
+  /// [streamOnly] makes an ephemeral torrent: no file downloads in the
+  /// background, pieces are fetched only as a stream reads them, and the
+  /// torrent and its files are removed when its stream stops.
+  /// [startPaused] adds it paused, so it connects to no peers until
+  /// [resumeTorrent]. [stopWhenReady] verifies existing files and then
+  /// pauses before transferring data, e.g. to restore a torrent without
+  /// briefly joining the swarm.
+  ///
+  /// Throws an [Exception] with libtorrent's message when the magnet is
+  /// invalid or the torrent is already in the session.
+  int addMagnet(
+    String magnetUri, [
+    String? savePath,
+    bool streamOnly = false,
+    bool startPaused = false,
+    bool stopWhenReady = false,
+  ]) {
     final enhanced = TrackerManager.injectTrackers(magnetUri);
     final m = enhanced.toNativeUtf8();
     final s = (savePath ?? _defaultSavePath).toNativeUtf8();
     try {
       final id = _b.addMagnet(
-          _session,
-          m,
-          s,
-          (streamOnly ? 1 : 0) |
-              (startPaused ? 2 : 0) |
-              (stopWhenReady ? 4 : 0));
+        _session,
+        m,
+        s,
+        (streamOnly ? 1 : 0) | (startPaused ? 2 : 0) | (stopWhenReady ? 4 : 0),
+      );
       if (id < 0) throw Exception(_b.lastError().toDartString());
       return id;
     } finally {
@@ -304,7 +322,8 @@ class LibtorrentFlutter implements Finalizable {
     }
   }
 
-  /// Add a torrent from a .torrent file path.
+  /// Add a torrent from a .torrent file path; the optional parameters are
+  /// those of [addMagnet]. Files already on disk are verified and reused.
   int addTorrentFile(
     String filePath, [
     String? savePath,
@@ -316,12 +335,11 @@ class LibtorrentFlutter implements Finalizable {
     final s = (savePath ?? _defaultSavePath).toNativeUtf8();
     try {
       final id = _b.addTorrentFile(
-          _session,
-          f,
-          s,
-          (streamOnly ? 1 : 0) |
-              (startPaused ? 2 : 0) |
-              (stopWhenReady ? 4 : 0));
+        _session,
+        f,
+        s,
+        (streamOnly ? 1 : 0) | (startPaused ? 2 : 0) | (stopWhenReady ? 4 : 0),
+      );
       if (id < 0) throw Exception(_b.lastError().toDartString());
       return id;
     } finally {
@@ -342,7 +360,11 @@ class LibtorrentFlutter implements Finalizable {
     final s = (savePath ?? _defaultSavePath).toNativeUtf8();
     try {
       final id = _b.addResume(
-          _session, r, s, (startPaused ? 2 : 0) | (stopWhenReady ? 4 : 0));
+        _session,
+        r,
+        s,
+        (startPaused ? 2 : 0) | (stopWhenReady ? 4 : 0),
+      );
       if (id < 0) throw Exception(_b.lastError().toDartString());
       return id;
     } finally {
@@ -364,7 +386,9 @@ class LibtorrentFlutter implements Finalizable {
   /// Resume a paused torrent.
   void resumeTorrent(int id) => _b.resumeTorrent(_session, id);
 
-  /// Save complete torrent metadata for offline restoration.
+  /// Write the torrent's metadata as a .torrent file at [path] (tracker
+  /// tiers included), so a magnet can be restored with [addTorrentFile]
+  /// without fetching metadata again; false while there is no metadata.
   bool saveMetadata(int id, String path) {
     final nativePath = path.toNativeUtf8();
     try {
@@ -385,7 +409,7 @@ class LibtorrentFlutter implements Finalizable {
     }
   }
 
-  /// Recheck torrent integrity.
+  /// Hash the torrent's files again, keeping the pieces that verify.
   void recheckTorrent(int id) => _b.recheckTorrent(_session, id);
 
   // ─── File Enumeration ───────────────────────────────────────────────────────
@@ -403,7 +427,9 @@ class LibtorrentFlutter implements Finalizable {
     }
   }
 
-  /// Set download priorities per file (0 = skip, 1-7 = priority levels).
+  /// Choose which files download: 0 skips a file, any other value
+  /// downloads it at default priority. Also resumes the torrent and clears
+  /// stop-when-ready.
   void setFilePriorities(int torrentId, List<int> priorities) {
     final count = priorities.length;
     final buf = calloc<Int32>(count);
@@ -421,10 +447,22 @@ class LibtorrentFlutter implements Finalizable {
 
   /// Start streaming a file from a torrent.
   ///
-  /// Returns [StreamInfo] with an HTTP URL that can be passed to any video player.
-  /// [fileIndex] = -1 auto-selects the largest streamable file.
-  /// [maxCacheBytes] controls how much RAM the piece cache uses (0 = default ~128MB).
+  /// Returns [StreamInfo] with an HTTP URL on 127.0.0.1 (its own port per
+  /// stream, with range requests) that can be passed to any video player.
+  /// The torrent needs metadata. [fileIndex] = -1 auto-selects the largest
+  /// streamable file. [maxCacheBytes] sizes the in-memory piece cache
+  /// (0 = [BtConfig.cacheSize], 64 MiB by default).
   /// [streaming] overrides [streamingConfig] for this stream.
+  ///
+  /// The stream prioritizes pieces around the player's position (see
+  /// [StreamingConfig]). For a normal torrent the rest of its pieces keep
+  /// downloading at low priority while the stream is open and at normal
+  /// priority after [stopStream]; a `streamOnly` torrent fetches only what
+  /// is read. Seeking never resumes a torrent the application paused,
+  /// except a `streamOnly` one.
+  ///
+  /// Throws an [Exception] when the torrent is unknown, has no metadata
+  /// yet, or the file index is invalid.
   StreamInfo startStream(
     int torrentId, {
     int fileIndex = -1,
@@ -469,7 +507,8 @@ class LibtorrentFlutter implements Finalizable {
     }
   }
 
-  /// Stop a stream.
+  /// Stop a stream and close its HTTP server. A `streamOnly` torrent is
+  /// removed with its files.
   void stopStream(int streamId) {
     _b.stopStream(_session, streamId);
     _streams.remove(streamId);
@@ -506,7 +545,8 @@ class LibtorrentFlutter implements Finalizable {
   ///
   /// - [capacity] — cache size in bytes (default 64MB).
   /// - [readAheadPct] — percentage 5-100 of cache used for read-ahead (default 95%).
-  /// - [connectionsLimit] — max concurrent piece requests per reader (default 25).
+  /// - [connectionsLimit] — peer connections of the stream's torrent
+  ///   (default 25).
   void setCacheSettings(
     int streamId, {
     int capacity = 0,
@@ -536,7 +576,11 @@ class LibtorrentFlutter implements Finalizable {
   ///
   /// Port of btserver.go configure(). Maps [BtConfig] fields to libtorrent
   /// settings_pack values: encryption, DHT, UPnP, rate limits, etc.
-  /// Also applies cache/reader settings to all future streams.
+  /// The listen port replaces init's `listenInterface` (all IPv4
+  /// interfaces, plus IPv6 when enabled). [BtConfig.connectionsLimit]
+  /// applies to every torrent, current and future; the session itself sets
+  /// no total connection cap. Cache settings apply to running and future
+  /// streams.
   void configureSession(BtConfig config) {
     final cfgPtr = calloc<LtBtConfig>();
     try {
@@ -593,7 +637,8 @@ class LibtorrentFlutter implements Finalizable {
     }
   }
 
-  /// Number of active streams across all torrents.
+  /// Number of HTTP connections currently being served, across all streams
+  /// of every session in the process.
   int get activeStreamCount => _b.getActiveStreams(_session);
 
   // ─── Polling ──────────────────────────────────────────────────────────────
@@ -711,8 +756,11 @@ class LibtorrentFlutter implements Finalizable {
     }
   }
 
-  /// Shut down the engine and destroy the native session without deleting data. After this, you'd need to call
-  /// [init] again to use the engine.
+  /// Shut down the engine and destroy the native session without deleting
+  /// data: streams stop and libtorrent flushes its disk cache before
+  /// closing. Save fast-resume data with [saveResume] first if
+  /// the application restores torrents with [addResume]. Call [init] again
+  /// to use the engine afterwards.
   Future<void> dispose() async {
     _pollTimer?.cancel();
     _b.sessionFinalizer.detach(this);
